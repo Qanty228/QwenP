@@ -156,7 +156,7 @@ function throwIfErrorJson(json: any): void {
   }
 }
 
-async function createRealQwenChat(headers: Record<string, string>, accountId?: string): Promise<string> {
+async function createRealQwenChat(headers: Record<string, string>, accountId?: string, chatMode = 'normal'): Promise<string> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
     return process.env.TEST_SESSION_ID || `mock-chat-${crypto.randomUUID()}`;
   }
@@ -164,7 +164,7 @@ async function createRealQwenChat(headers: Record<string, string>, accountId?: s
   const body = JSON.stringify({
     title: 'Nova Conversa',
     models: ['qwen3.7-plus'],
-    chat_mode: 'normal',
+    chat_mode: chatMode,
     chat_type: 't2t',
     timestamp: Date.now(),
     project_id: '',
@@ -303,6 +303,13 @@ async function refillPoolForAccount(accountId: string) {
   let pool = warmPool.get(accountId);
   if (!pool) { pool = []; warmPool.set(accountId, pool); }
   cleanupStalePool(accountId);
+  // Temporary-chat mode marks every chat it creates with chat_mode: 'local'
+  // (the same signal chat.qwen.ai uses for ?temporary-chat=true). Warm-pool
+  // entries are created ahead of time without knowing the mode, so they can't
+  // carry that marker — skip pooling entirely while the flag is on so each
+  // request creates its own local-mode chat on demand. Chats are never
+  // deleted after the session ends.
+  if (getRuntimeBool('QWEN_TEMPORARY_CHAT', config.temporaryChat.enabled)) return;
   const need = Math.max(0, getPoolSize() - pool.length);
   if (need === 0) return;
 
@@ -360,6 +367,16 @@ async function refillPoolForAccount(accountId: string) {
 }
 
 export async function getWarmedChat(accountId?: string) {
+  // Temporary-chat mode: bypass the pool entirely and create a fresh chat
+  // marked with chat_mode: 'local' (the signal chat.qwen.ai uses for
+  // ?temporary-chat=true). The chat is never deleted after the session ends.
+  if (getRuntimeBool('QWEN_TEMPORARY_CHAT', config.temporaryChat.enabled)) {
+    const acctId = accountId === 'global' ? undefined : accountId;
+    const headers = await getBasicQwenHeaders(acctId);
+    const chatId = await createRealQwenChat(headers, acctId, 'local');
+    return { chatId, headers, accountId: accountId || 'global', timestamp: Date.now() };
+  }
+
   if (getPoolSize() <= 0) {
     const acctId = accountId === 'global' ? undefined : accountId;
     const headers = await getBasicQwenHeaders(acctId);

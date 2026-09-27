@@ -579,7 +579,13 @@ export async function createQwenStream(
   options?: CreateQwenStreamOptions,
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string, controller: AbortController, accountId: string }> {
   const sessionKey = options?.sessionKey;
-  const session = sessionKey && !options?.forceBootstrap ? getSession(sessionKey) : undefined;
+  // Temporary-chat mode mirrors chat.qwen.ai/?temporary-chat=true: every
+  // completion is flagged as ephemeral upstream (never persisted to the
+  // account history) and no local session/chat pinning happens, so each
+  // request gets a fresh throwaway chat. Read live so the admin dashboard can
+  // toggle it without a restart.
+  const temporaryChat = getRuntimeBool('QWEN_TEMPORARY_CHAT', config.temporaryChat.enabled);
+  const session = !temporaryChat && sessionKey && !options?.forceBootstrap ? getSession(sessionKey) : undefined;
 
   const useEconomical = !!(
     sessionKey &&
@@ -694,7 +700,13 @@ export async function createQwenStream(
     })();
   }
 
-  if (options?.chatId) {
+  if (temporaryChat && options?.chatId) {
+    // Temporary chats must be created with chat_mode: 'local', so a
+    // caller-supplied (normal-mode) chat id cannot be reused — fall through
+    // and create a fresh local chat instead.
+    console.warn('[Qwen] Temporary-chat mode ignores caller-provided chatId; creating a local-mode chat instead.');
+  }
+  if (!temporaryChat && options?.chatId) {
     chatId = options.chatId;
     if (options.chatHeaders) {
       chatHeaders = options.chatHeaders;
@@ -723,7 +735,7 @@ export async function createQwenStream(
     const guestBody = JSON.stringify({
       title: 'Guest Chat',
       models: [modelId.replace('-no-thinking', '').replace('-thinking', '')],
-      chat_mode: 'guest',
+      chat_mode: temporaryChat ? 'local' : 'guest',
       chat_type: 't2t',
       timestamp: Date.now(),
       project_id: '',
@@ -799,7 +811,7 @@ export async function createQwenStream(
     ? session.accountId
     : (accountId === 'guest' ? 'guest' : (accountId || 'global'));
 
-  if (sessionKey && !useEconomical) {
+  if (sessionKey && !useEconomical && !temporaryChat) {
     setSession(sessionKey, {
       chatId,
       accountId: chatAccountKey,
@@ -909,7 +921,7 @@ export async function createQwenStream(
       version: '2.1',
       incremental_output: true,
       chat_id: chatId,
-      chat_mode: accountId === 'guest' ? 'guest' : 'normal',
+      chat_mode: temporaryChat ? 'local' : (accountId === 'guest' ? 'guest' : 'normal'),
       model: model,
       parent_id: actualParentId,
       messages: [
