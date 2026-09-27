@@ -62,6 +62,7 @@ const envSchema = z.object({
   ACCOUNT_MAX_CONCURRENT_STREAMS: envInt(2, 1),
   ACCOUNT_STREAM_SLOT_WAIT_MS: envInt(30000, 1000),
   QWEN_DIRECT_FETCH: envBool(true),
+  QWEN_TEMPORARY_CHAT: envBool(false),
   LARGE_PROMPT_THRESHOLD: envInt(524288, 1),
   LARGE_PROMPT_INLINE: envBool(false),
   LARGE_PROMPT_UPLOAD_CACHE_TTL_MS: envInt(1800000, 0),
@@ -167,6 +168,9 @@ export const config = {
   },
   directFetch: {
     enabled: env.QWEN_DIRECT_FETCH,
+  },
+  temporaryChat: {
+    enabled: env.QWEN_TEMPORARY_CHAT,
   },
   precapture: {
     headersStartup: env.PRECAPTURE_HEADERS_STARTUP,
