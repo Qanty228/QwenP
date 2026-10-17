@@ -9,6 +9,10 @@ import crypto from 'crypto';
 import { sleep } from '../utils/sleep.js';
 import { CACHED_TIMEZONE, QWEN_WEB_VERSION } from '../utils/qwen-constants.js';
 
+function isTmdChallenge(text: string): boolean {
+  return text.includes('FAIL_SYS_USER_VALIDATE') || text.includes('_____tmd_____') || text.includes('RGV587_ERROR');
+}
+
 export interface WarmPoolEntry {
   chatId: string;
   headers: Record<string, string>;
@@ -183,6 +187,10 @@ async function createRealQwenChat(headers: Record<string, string>, accountId?: s
       if (result.status === 429) {
         throw new QwenUpstreamError('Qwen upstream error: RateLimited: Too many requests.', 'RateLimited', 429);
       }
+      if (isTmdChallenge(result.body)) {
+        recordAccountBlock(accountId, 'captcha', `TMD challenge during warm-pool direct fetch: ${result.body.slice(0, 200)}`);
+        throw new QwenUpstreamError('Qwen anti-bot (TMD) challenge detected during warm-pool chat creation', 'FAIL_SYS_USER_VALIDATE', 403);
+      }
       if (result.status && result.status >= 400) {
         throw new Error(`Failed to create chat: ${result.status} - ${result.body}`);
       }
@@ -215,6 +223,10 @@ async function createRealQwenChat(headers: Record<string, string>, accountId?: s
 
       if (result.status === 429) {
         throw new QwenUpstreamError('Qwen upstream error: RateLimited: Too many requests.', 'RateLimited', 429);
+      }
+      if (isTmdChallenge(result.body)) {
+        recordAccountBlock(accountId!, 'captcha', `TMD challenge during warm-pool browser fetch: ${result.body.slice(0, 200)}`);
+        throw new QwenUpstreamError('Qwen anti-bot (TMD) challenge detected during warm-pool browser chat creation', 'FAIL_SYS_USER_VALIDATE', 403);
       }
       if (!result.status || result.status >= 400) {
         throw new Error(`Failed to create chat: ${result.status} - ${result.body}`);
@@ -263,6 +275,9 @@ async function fetchUnusedChats(headers: Record<string, string>, accountId?: str
         timeoutMs: config.timeouts.http,
       });
       if (result.status && result.status < 400 && result.body) {
+        if (accountId && isTmdChallenge(result.body)) {
+          recordAccountBlock(accountId, 'captcha', `TMD challenge during warm-pool chat list fetch: ${result.body.slice(0, 200)}`);
+        }
         return parseUnusedChats(result.body);
       }
     } catch (err: any) {
@@ -287,6 +302,9 @@ async function fetchUnusedChats(headers: Record<string, string>, accountId?: str
         timeoutMs: config.timeouts.http,
       });
       if (result.status && result.status < 400) {
+        if (accountId && isTmdChallenge(result.body)) {
+          recordAccountBlock(accountId, 'captcha', `TMD challenge during warm-pool browser chat list fetch: ${result.body.slice(0, 200)}`);
+        }
         body = result.body;
       }
     } catch (err: any) {
