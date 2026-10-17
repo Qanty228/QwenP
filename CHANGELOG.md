@@ -1,3 +1,10 @@
+## [1.34.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.1...v1.34.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **warm-pool:** detect TMD/captcha challenges and quarantine accounts ([1392cfb](https://github.com/pedrofariasx/qwenproxy/commit/1392cfb8257760daae52c889b829e67ecbf567a6))
+
 ## [1.34.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.0...v1.34.1) (2026-10-08)
 
 
