@@ -1,3 +1,10 @@
+## [1.36.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.36.0...v1.36.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* hide the daily-limit notice from the client while failing over ([6fec584](https://github.com/pedrofariasx/qwenproxy/commit/6fec5847b5589cfd889f7ba4601d12eb1119e340))
+
 # [1.36.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.35.1...v1.36.0) (2026-10-21)
 
 
