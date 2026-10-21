@@ -1,3 +1,10 @@
+# [1.37.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.36.1...v1.37.0) (2026-10-21)
+
+
+### Features
+
+* improve Docker compatibility, ergonomics and documentation ([00a7ae7](https://github.com/pedrofariasx/qwenproxy/commit/00a7ae7cc0f938cd36ba250ddafd4a56dbfe9e6e))
+
 ## [1.36.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.36.0...v1.36.1) (2026-10-21)
 
 
