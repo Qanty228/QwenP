@@ -5,6 +5,8 @@
  * final answer.
  */
 
+import { isQuotaLimitMessage } from './quota-detector.js';
+
 const DEGENERATE_PHRASES = [
   'yes',
   'yeah',
@@ -58,6 +60,11 @@ export function isDegenerateAnswer(content: string | null | undefined): boolean 
 export function canFastReleaseGuard(content: string): boolean {
   const trimmed = (content || '').trim();
   if (!trimmed || trimmed.length < 5) return false;
+
+  // A daily-limit notice is a long, well-formed sentence, so it would pass
+  // the substantive-answer checks below and be streamed to the client before
+  // the quota failover could hide it. Never fast release it.
+  if (isQuotaLimitMessage(trimmed)) return false;
 
   // If it starts with any known degenerate word, do NOT fast release
   if (DEGENERATE_RE.test(trimmed)) return false;

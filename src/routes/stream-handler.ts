@@ -119,6 +119,20 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       }
     };
 
+    /**
+     * Drops everything buffered for the current attempt.
+     *
+     * Used when the attempt is abandoned (quota limit, overload, degenerate
+     * answer): the partial output of the failed attempt must never reach the
+     * client, otherwise the user sees the failure notice followed by the
+     * successful answer.
+     */
+    const discardBufferedOutput = () => {
+      heldOutput = '';
+      writeBuffer = '';
+      if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
+    };
+
     const flushWrites = () => {
       if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
       if (guardActive) {
@@ -277,7 +291,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       completionTokens = 0;
       promptTokens = estimatedPromptTokens;
 
-      const resetStreamState = () => {
+      const resetStreamState = (options?: { keepQuotaRetries?: boolean }) => {
         _reasoningBuffer = '';
         lastFullContent = '';
         contentLength = 0;
@@ -299,9 +313,14 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         sawOverloadSignal = false;
         overloadRetried = false;
         sawQuotaLimitSignal = false;
-        quotaLimitRetriesLeft = ctx.onQuotaLimitRetry
-          ? Math.max(1, getAccountCount() + 1)
-          : 0;
+        // The quota retry budget spans the whole request: it must not be
+        // restored on every attempt, otherwise a request whose accounts are all
+        // out of quota would loop forever.
+        if (!options?.keepQuotaRetries) {
+          quotaLimitRetriesLeft = ctx.onQuotaLimitRetry
+            ? Math.max(1, getAccountCount() + 1)
+            : 0;
+        }
         heldOutput = '';
         guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry || !!ctx.onOverloadRetry || !!ctx.onQuotaLimitRetry;
       };
@@ -443,7 +462,12 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                 }
                 fastWriteReasoning(vStr);
               } else {
-                if (guardActive && !sawOverloadSignal && canFastReleaseGuard(lastFullContent)) {
+                // The daily-limit notice is a long, well-formed sentence, so
+                // it would pass the "substantive answer" fast-release check and
+                // reach the client before the quota signal is evaluated. Keep
+                // the guard closed while a quota notice is still possible.
+                const quotaStillPossible = ctx.onQuotaLimitRetry && !sawQuotaLimitSignal;
+                if (guardActive && !sawOverloadSignal && !quotaStillPossible && canFastReleaseGuard(lastFullContent)) {
                   releaseGuard();
                 }
                 if (ctx.hasTools && toolParser) {
@@ -501,6 +525,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
             return;
           }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
           activeStream = retried.stream;
           await readUpstream(retried.stream);
@@ -531,6 +556,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
             return;
           }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
           activeStream = retried.stream;
           await readUpstream(retried.stream);
@@ -552,6 +578,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
             return;
           }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
           activeStream = retried.stream;
           await readUpstream(retried.stream);
@@ -562,7 +589,10 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       // Daily quota guard: the account ran out of the daily limit for the
       // requested model. Retry on another account with the same model so the
       // client keeps using the model it asked for.
-      if (
+      //
+      // This is a loop because the next account may be out of quota too: the
+      // request walks through the accounts until one can serve the model.
+      while (
         ctx.onQuotaLimitRetry &&
         quotaLimitRetriesLeft > 0 &&
         (sawQuotaLimitSignal || isQuotaLimitMessage(lastFullContent))
@@ -571,17 +601,17 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         quotaLimitRetriesLeft--;
         console.warn('[Chat] Account daily model limit hit. Retrying with another account...');
         const retried = await ctx.onQuotaLimitRetry();
-        if (retried) {
-          if (clientAborted()) {
-            retried.stream.cancel('client aborted stream').catch(() => {});
-            return;
-          }
-          ctx.uiSessionId = retried.uiSessionId;
-          resetStreamState();
-          activeStream = retried.stream;
-          await readUpstream(retried.stream);
-          if (toolParser?.isInsideTool()) sawToolCallSignal = true;
+        if (!retried) break;
+        if (clientAborted()) {
+          retried.stream.cancel('client aborted stream').catch(() => {});
+          return;
         }
+        ctx.uiSessionId = retried.uiSessionId;
+        discardBufferedOutput();
+        resetStreamState({ keepQuotaRetries: true });
+        activeStream = retried.stream;
+        await readUpstream(retried.stream);
+        if (toolParser?.isInsideTool()) sawToolCallSignal = true;
       }
 
       // Membership-limit guard: the upstream account hit a membership/usage
@@ -603,6 +633,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
             return;
           }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
           activeStream = retried.stream;
           await readUpstream(retried.stream);
