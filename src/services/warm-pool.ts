@@ -7,7 +7,8 @@ import { getClientHintsHeaders } from './browser-manager.js';
 import type { Page } from 'playwright';
 import crypto from 'crypto';
 import { sleep } from '../utils/sleep.js';
-import { CACHED_TIMEZONE, QWEN_WEB_VERSION } from '../utils/qwen-constants.js';
+import { CACHED_TIMEZONE } from '../utils/qwen-constants.js';
+import { getQwenWebVersion } from './qwen-versions.js';
 
 function isTmdChallenge(text: string): boolean {
   return text.includes('FAIL_SYS_USER_VALIDATE') || text.includes('_____tmd_____') || text.includes('RGV587_ERROR');
@@ -99,7 +100,7 @@ function buildWarmPoolNodeHeaders(headers: Record<string, string>, accountId?: s
     'sec-fetch-site': 'same-origin',
     'timezone': CACHED_TIMEZONE,
     'user-agent': headers['user-agent'],
-    'version': QWEN_WEB_VERSION,
+    'version': getQwenWebVersion(),
     'x-request-id': crypto.randomUUID(),
     'bx-v': headers['bx-v'],
     'bx-ua': headers['bx-ua'],

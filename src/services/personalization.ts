@@ -10,6 +10,7 @@
 
 import { config } from '../core/config.js'
 import { getBasicHeaders, getQwenHeaders } from './header-interceptor.js'
+import { getBxVersion } from './qwen-versions.js'
 import { listHeaderAccountIds } from './browser-manager.js'
 import { getBaseAccountId } from '../core/account-lanes.js'
 import { getPersonalizationRow, savePersonalizationRow } from '../core/database.js'
@@ -76,7 +77,7 @@ async function applyToAccount(accountId: string, email?: string): Promise<ApplyR
         'Content-Type': 'application/json',
         Origin: config.qwen.baseUrl,
         Referer: `${config.qwen.baseUrl}/settings/personalization`,
-        'bx-v': headers.bxV || '2.5.37',
+        'bx-v': headers.bxV || getBxVersion(),
         'bx-ua': headers.bxUa || '',
         'bx-umidtoken': headers.bxUmidtoken || '',
         source: 'web',

@@ -1,5 +1,7 @@
 import type { Page } from 'playwright';
 import { config } from '../core/config.js';
+import { QWEN_BX_VERSION_FALLBACK } from '../utils/qwen-constants.js';
+import { getBxVersion, refreshQwenVersions } from './qwen-versions.js';
 import { getActiveAccountCount, markAccountReady } from '../core/account-manager.js';
 import { getBaseAccountId } from '../core/account-lanes.js';
 import {
@@ -127,7 +129,7 @@ export async function extractAntiBotTokensFromPage(page: Page): Promise<{ bxUa: 
 }
 
 export async function getBasicHeaders(accountId?: string): Promise<{ cookie: string, userAgent: string, bxV: string, bxUa?: string, bxUmidtoken?: string, authorization?: string }> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36', bxUa: 'mock-bx-ua', bxUmidtoken: 'mock-bx-umidtoken', authorization: 'Bearer mock' };
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: QWEN_BX_VERSION_FALLBACK, bxUa: 'mock-bx-ua', bxUmidtoken: 'mock-bx-umidtoken', authorization: 'Bearer mock' };
 
   let page = accountId ? accountPages.get(accountId) : getActivePage();
   if (accountId && !page) {
@@ -154,7 +156,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
   let bxUa = cache.currentHeaders['bx-ua'];
   let bxUmidtoken = cache.currentHeaders['bx-umidtoken'];
   let authorization = cache.currentHeaders['authorization'];
-  const bxV = cache.currentHeaders['bx-v'] || '2.5.37';
+  const bxV = cache.currentHeaders['bx-v'] || getBxVersion();
 
   if (!bxUa || !bxUmidtoken || !authorization) {
     // Fast path: extract directly from AWSC and __awsc_et__ on the page
@@ -166,12 +168,12 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
       cache.currentHeaders['bx-ua'] = bxUa;
       cache.currentHeaders['bx-umidtoken'] = bxUmidtoken;
       cache.currentHeaders['authorization'] = authorization;
-      cache.currentHeaders['bx-v'] = '2.5.37';
+      cache.currentHeaders['bx-v'] = getBxVersion();
       markAccountReady(cacheKey);
       return {
         cookie: await getCookies(accountId),
         userAgent,
-        bxV: '2.5.37',
+        bxV: getBxVersion(),
         bxUa,
         bxUmidtoken,
         authorization,
@@ -255,7 +257,7 @@ export async function getGuestHeaders(): Promise<Record<string, string>> {
           'cookie': reqHeaders['cookie'] || '',
           'bx-ua': reqHeaders['bx-ua'] || '',
           'bx-umidtoken': reqHeaders['bx-umidtoken'] || '',
-          'bx-v': reqHeaders['bx-v'] || '2.5.36',
+          'bx-v': reqHeaders['bx-v'] || getBxVersion(),
           'user-agent': reqHeaders['user-agent'] || CHROME_UA,
         };
 
@@ -426,7 +428,7 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
         'authorization': 'Bearer MOCK',
         'cookie': 'token=mock',
         'user-agent': 'mock',
-        'bx-v': '2.5.36',
+        'bx-v': getBxVersion(),
         'bx-ua': 'mock-bx-ua',
         'bx-umidtoken': 'mock-bx-umidtoken'
       },
@@ -468,6 +470,9 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
       console.warn(`[Playwright] Warning navigating to new-chat: ${err.message}`);
     }
   }
+
+  // Keep the `version` and `bx-v` headers aligned with the live deployment.
+  await refreshQwenVersions(page).catch(() => undefined);
 
   const isLoginPage = page.url().includes('login') || page.url().includes('auth') || (await page.$('input[name="email"], input[type="email"]'));
   if (isLoginPage) {
@@ -541,7 +546,7 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
       cookie: cookies,
       'bx-ua': directTokens.bxUa,
       'bx-umidtoken': directTokens.bxUmidtoken,
-      'bx-v': '2.5.37',
+      'bx-v': getBxVersion(),
       'user-agent': userAgent,
       'x-request-id': '',
       ...(authorization ? { 'authorization': authorization } : {}),

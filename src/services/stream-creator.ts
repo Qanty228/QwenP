@@ -13,7 +13,8 @@ import { uploadLargePromptAsFile } from '../routes/upload.js';
 import { getSession, setSession, getSessionParent, updateSessionParent } from './session-manager.js';
 import { buildAnswerDirective } from '../utils/degenerate-answer.js';
 import { sleep } from '../utils/sleep.js';
-import { CACHED_TIMEZONE, QWEN_WEB_VERSION } from '../utils/qwen-constants.js';
+import { CACHED_TIMEZONE } from '../utils/qwen-constants.js';
+import { getQwenWebVersion } from './qwen-versions.js';
 import crypto from 'crypto';
 
 export { updateSessionParent };
@@ -36,7 +37,7 @@ function buildBrowserCompletionHeaders(headers: Record<string, string>): Record<
     'accept': 'application/json',
     'content-type': 'application/json',
     'timezone': CACHED_TIMEZONE,
-    'version': QWEN_WEB_VERSION,
+    'version': getQwenWebVersion(),
     'x-accel-buffering': 'no',
     'x-request-id': crypto.randomUUID(),
     'bx-v': headers['bx-v'],
@@ -59,7 +60,7 @@ function buildNodeCompletionHeaders(headers: Record<string, string>, chatId: str
     'sec-fetch-site': 'same-origin',
     'timezone': CACHED_TIMEZONE,
     'user-agent': headers['user-agent'],
-    'version': QWEN_WEB_VERSION,
+    'version': getQwenWebVersion(),
     'x-accel-buffering': 'no',
     'x-request-id': crypto.randomUUID(),
     'bx-v': headers['bx-v'],
@@ -360,7 +361,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
             'origin': 'https://chat.qwen.ai',
             'referer': 'https://chat.qwen.ai/',
             'user-agent': headers['user-agent'],
-            'version': QWEN_WEB_VERSION,
+            'version': getQwenWebVersion(),
             'x-request-id': crypto.randomUUID(),
             'bx-ua': headers['bx-ua'],
             'bx-umidtoken': headers['bx-umidtoken'],
@@ -411,7 +412,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
           } finally {
             clearTimeout(timeoutId);
           }
-        }, { payload, timeoutMs: config.timeouts.http, qwenVersion: QWEN_WEB_VERSION });
+        }, { payload, timeoutMs: config.timeouts.http, qwenVersion: getQwenWebVersion() });
 
         if (result.status && result.status < 400) {
           console.log(`[Qwen] Native tools disabled successfully for ${cacheKey}.`);

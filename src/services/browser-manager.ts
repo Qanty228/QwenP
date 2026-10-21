@@ -8,6 +8,7 @@ import { getBaseAccountId } from '../core/account-lanes.js';
 import { markAccountNotReady, markAccountReady } from '../core/account-manager.js';
 import { getRuntimeInt, getRuntimeBool } from '../core/runtime-config.js';
 import { getStealthScript } from './stealth.js';
+import { rememberQwenVersions, refreshQwenVersions } from './qwen-versions.js';
 import { solveAliyunWafCaptcha } from './captcha-solver.js';
 import { getFingerprintProfile, type FingerprintProfile } from './fingerprint.js';
 import { setFingerprintRotationListener } from '../core/account-isolation.js';
@@ -185,6 +186,9 @@ export function listHeaderAccountIds(): string[] {
  * endpoint right after signin and the response body carries the JWT that is
  * later sent as `authorization: Bearer <token>`. The token is NOT persisted in
  * localStorage/cookies, so it has to be captured from the network response.
+ *
+ * The same listener also records the `version` and `bx-v` headers the live
+ * client sends, which keeps those constants in sync with the deployment.
  */
 export function installAccessTokenCapture(page: Page): { getToken: () => string | null } {
   let accessToken: string | null = null;
@@ -206,6 +210,23 @@ export function installAccessTokenCapture(page: Page): { getToken: () => string 
   };
 
   page.on('response', handler);
+
+  const requestHandler = (req: any) => {
+    const url = req.url();
+    if (!url.includes('/api/v2/')) return;
+    let headers: Record<string, string>;
+    try {
+      headers = req.headers();
+    } catch {
+      return;
+    }
+    rememberQwenVersions({
+      webVersion: headers['version'] || null,
+      bxVersion: headers['bx-v'] || null,
+    });
+  };
+
+  page.on('request', requestHandler);
 
   return {
     getToken: () => accessToken,
@@ -782,6 +803,10 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
   };
 
   await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+
+  // Detect the live Qwen web version and Aliyun Baxia version so the
+  // `version` and `bx-v` headers always match what the deployment expects.
+  await refreshQwenVersions(acctPage).catch(() => undefined);
 
   // Always attempt UI login when credentials are available. The Bearer token
   // (authorization header) is only issued by the signin flow, so a cached
