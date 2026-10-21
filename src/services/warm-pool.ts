@@ -73,19 +73,17 @@ async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, s
   if (!cookie || !userAgent || !bxV || !bxUa || !bxUmidtoken) {
     throw new Error('Missing required browser anti-bot headers for warm pool');
   }
-  const headers: Record<string, string> = {
+  if (!authorization) {
+    throw new Error('Missing Qwen authorization token for warm pool');
+  }
+  return {
     cookie,
     'user-agent': userAgent,
     'bx-v': bxV,
     'bx-ua': bxUa,
     'bx-umidtoken': bxUmidtoken,
+    'authorization': authorization,
   };
-  if (authorization) {
-    headers['authorization'] = authorization;
-  } else {
-    console.warn(`[WarmPool] No authorization bearer token available for ${accountId}; browser path will rely on page-injected auth.`);
-  }
-  return headers;
 }
 
 function buildWarmPoolNodeHeaders(headers: Record<string, string>, accountId?: string): Record<string, string> {

@@ -2,6 +2,8 @@ import type { Page } from 'playwright';
 import { config } from '../core/config.js';
 import { QWEN_BX_VERSION_FALLBACK } from '../utils/qwen-constants.js';
 import { getBxVersion, refreshQwenVersions } from './qwen-versions.js';
+import { applyBearerToken, renewAccessToken } from './access-token-manager.js';
+import { hasExpiredBearerToken } from '../utils/access-token.js';
 import { getActiveAccountCount, markAccountReady } from '../core/account-manager.js';
 import { getBaseAccountId } from '../core/account-lanes.js';
 import {
@@ -155,8 +157,20 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
   const cache = getAccountHeaderCache(cacheKey);
   let bxUa = cache.currentHeaders['bx-ua'];
   let bxUmidtoken = cache.currentHeaders['bx-umidtoken'];
-  let authorization = cache.currentHeaders['authorization'];
+  let authorization: string | undefined = cache.currentHeaders['authorization'];
   const bxV = cache.currentHeaders['bx-v'] || getBxVersion();
+
+  // A cached access token expires after 15 minutes. Renew it up-front so
+  // callers never receive headers that upstream would reject.
+  if (authorization && hasExpiredBearerToken({ authorization })) {
+    const renewed = await renewAccessToken(accountId, page);
+    if (renewed) {
+      authorization = renewed;
+      cache.currentHeaders['authorization'] = renewed;
+    } else {
+      authorization = undefined;
+    }
+  }
 
   if (!bxUa || !bxUmidtoken || !authorization) {
     // Fast path: extract directly from AWSC and __awsc_et__ on the page
@@ -321,17 +335,33 @@ export async function getQwenHeaders(forceNew = false, accountId?: string): Prom
   const cache = getAccountHeaderCache(cacheKey);
 
   if (!forceNew && cache.cachedQwenHeaders) {
-    const age = Date.now() - cache.lastHeadersTime;
-    if (age < getHeadersTtlMs()) {
-      if (getBackgroundHeaderRefresh() && age > getHeadersTtlMs() * REFRESH_THRESHOLD && !cache.refreshInProgress) {
-        cache.refreshInProgress = true;
-        getQwenHeaders(true, accountId).catch((err) => {
-          console.warn(`[Playwright] Background header refresh failed for ${cacheKey}:`, (err as Error).message);
-        }).finally(() => {
-          cache.refreshInProgress = false;
-        });
+    // A cached access token expires after 15 minutes, well before the header
+    // cache TTL. Renew it instead of serving a token that no longer works.
+    if (hasExpiredBearerToken(cache.cachedQwenHeaders.headers)) {
+      const renewed = await renewAccessToken(accountId);
+      if (renewed) {
+        cache.cachedQwenHeaders = {
+          ...cache.cachedQwenHeaders,
+          headers: applyBearerToken(cache.cachedQwenHeaders.headers, renewed),
+        };
+        cache.currentHeaders['authorization'] = renewed;
+        return cache.cachedQwenHeaders;
       }
-      return cache.cachedQwenHeaders;
+      // Renewal failed: fall through to a full header capture.
+      forceNew = true;
+    } else {
+      const age = Date.now() - cache.lastHeadersTime;
+      if (age < getHeadersTtlMs()) {
+        if (getBackgroundHeaderRefresh() && age > getHeadersTtlMs() * REFRESH_THRESHOLD && !cache.refreshInProgress) {
+          cache.refreshInProgress = true;
+          getQwenHeaders(true, accountId).catch((err) => {
+            console.warn(`[Playwright] Background header refresh failed for ${cacheKey}: ${(err as Error).message}`);
+          }).finally(() => {
+            cache.refreshInProgress = false;
+          });
+        }
+        return cache.cachedQwenHeaders;
+      }
     }
   }
 
@@ -517,15 +547,26 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
   }
 
   // The Bearer token is issued by auth.qwen.ai/api/v2/auths/refresh, which
-  // requires the refresh_token cookie set during signin. Force a refresh to
-  // obtain a fresh access token.
-  let accessToken: string | null = cache.currentHeaders['authorization']
-    ? cache.currentHeaders['authorization'].replace(/^Bearer\s+/i, '')
+  // requires the refresh_token cookie set during signin. A cached token that
+  // already expired must be renewed, otherwise upstream rejects every call
+  // with a generic "Unauthorized" error.
+  const cachedAuthorization = cache.currentHeaders['authorization'];
+  let accessToken: string | null = cachedAuthorization
+    ? cachedAuthorization.replace(/^Bearer\s+/i, '')
     : null;
 
+  if (accessToken && hasExpiredBearerToken({ authorization: cachedAuthorization })) {
+    accessToken = null;
+  }
+
   if (!accessToken) {
-    const { refreshQwenAccessToken } = await import('./browser-manager.js');
+    const { refreshQwenAccessToken, renewAccessTokenViaPage } = await import('./browser-manager.js');
     accessToken = await refreshQwenAccessToken(page);
+    if (!accessToken) {
+      // The refresh endpoint only accepts requests issued by the real web
+      // client, so let the frontend perform the refresh by reloading.
+      accessToken = await renewAccessTokenViaPage(page);
+    }
     if (accessToken) {
       console.log(`[Playwright] Refreshed Qwen access token for ${cacheKey}.`);
     } else {

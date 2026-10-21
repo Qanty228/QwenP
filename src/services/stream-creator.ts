@@ -15,6 +15,7 @@ import { buildAnswerDirective } from '../utils/degenerate-answer.js';
 import { sleep } from '../utils/sleep.js';
 import { CACHED_TIMEZONE } from '../utils/qwen-constants.js';
 import { getQwenWebVersion } from './qwen-versions.js';
+import { hasExpiredBearerToken } from '../utils/access-token.js';
 import crypto from 'crypto';
 
 export { updateSessionParent };
@@ -33,7 +34,7 @@ function isTmdChallenge(text: string): boolean {
 }
 
 function buildBrowserCompletionHeaders(headers: Record<string, string>): Record<string, string> {
-  return {
+  const result: Record<string, string> = {
     'accept': 'application/json',
     'content-type': 'application/json',
     'timezone': CACHED_TIMEZONE,
@@ -45,6 +46,13 @@ function buildBrowserCompletionHeaders(headers: Record<string, string>): Record<
     'bx-umidtoken': headers['bx-umidtoken'],
     'source': 'web',
   };
+  // The browser fetch runs in the page context, where Qwen's own frontend
+  // does not inject the bearer token for programmatic requests, so it has to
+  // be forwarded explicitly.
+  if (headers['authorization']) {
+    result['authorization'] = headers['authorization'];
+  }
+  return result;
 }
 
 function buildNodeCompletionHeaders(headers: Record<string, string>, chatId: string, accountId?: string): Record<string, string> {
@@ -367,6 +375,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
             'bx-umidtoken': headers['bx-umidtoken'],
             'bx-v': headers['bx-v'],
             'source': 'web',
+            ...(headers['authorization'] ? { 'authorization': headers['authorization'] } : {}),
             ...getClientHintsHeaders(accountId),
           },
           body: JSON.stringify(payload),
@@ -683,6 +692,7 @@ export async function createQwenStream(
           'bx-ua': headers['bx-ua'] || '',
           'bx-umidtoken': headers['bx-umidtoken'] || '',
           'bx-v': headers['bx-v'] || '',
+          ...(headers['authorization'] ? { 'authorization': headers['authorization'] } : {}),
         };
         if (!uploadHeaders['bx-ua']) {
           const { headers: refreshed } = await getQwenHeaders(true, accountId);
@@ -692,6 +702,7 @@ export async function createQwenStream(
             'bx-ua': refreshed['bx-ua'],
             'bx-umidtoken': refreshed['bx-umidtoken'],
             'bx-v': refreshed['bx-v'] || uploadHeaders['bx-v'],
+            ...(refreshed['authorization'] ? { 'authorization': refreshed['authorization'] } : {}),
           });
         }
         assertAntiBotHeaders(uploadHeaders, 'Speculative large prompt upload');
@@ -715,17 +726,21 @@ export async function createQwenStream(
   } else if (useEconomical && session) {
     chatId = session.chatId;
     chatHeaders = session.headers;
-    if (!chatHeaders['cookie'] || !chatHeaders['bx-ua'] || !chatHeaders['bx-umidtoken']) {
+    const sessionAccountId = session.accountId === 'global' ? undefined : session.accountId;
+    // A persisted session can hold an access token that expired long ago
+    // (the token lives 15 minutes, sessions live for hours). Renew it instead
+    // of replaying a token that upstream will reject as Unauthorized.
+    if (!chatHeaders['cookie'] || !chatHeaders['bx-ua'] || !chatHeaders['bx-umidtoken'] || hasExpiredBearerToken(chatHeaders)) {
       try {
-        const { headers } = await getQwenHeaders(true, session.accountId === 'global' ? undefined : session.accountId);
+        const { headers } = await getQwenHeaders(true, sessionAccountId);
         chatHeaders = { ...headers };
         session.headers = chatHeaders;
       } catch (err: any) {
         console.warn(`[Session] Failed to refresh headers for session ${sessionKey}:`, err.message);
       }
     }
-      assertAntiBotHeaders(chatHeaders, 'Pinned session');
-    } else if (accountId === 'guest') {
+    assertAntiBotHeaders(chatHeaders, 'Pinned session');
+  } else if (accountId === 'guest') {
     chatHeaders = await getGuestHeaders();
     assertAntiBotHeaders(chatHeaders, 'Guest session');
     const guestPage = getPageForAccount('guest');
@@ -843,6 +858,7 @@ export async function createQwenStream(
             'bx-ua': chatHeaders['bx-ua'] || '',
             'bx-umidtoken': chatHeaders['bx-umidtoken'] || '',
             'bx-v': chatHeaders['bx-v'] || '',
+            ...(chatHeaders['authorization'] ? { 'authorization': chatHeaders['authorization'] } : {}),
           };
           if (!uploadHeaders['bx-ua']) {
             console.warn('[Qwen] Missing bx-ua header for large prompt upload, attempting forced refresh...');
@@ -853,6 +869,7 @@ export async function createQwenStream(
               'bx-ua': refreshedHeaders['bx-ua'],
               'bx-umidtoken': refreshedHeaders['bx-umidtoken'],
               'bx-v': refreshedHeaders['bx-v'] || uploadHeaders['bx-v'],
+              ...(refreshedHeaders['authorization'] ? { 'authorization': refreshedHeaders['authorization'] } : {}),
             });
           }
           assertAntiBotHeaders(uploadHeaders, 'Large prompt upload');
@@ -878,6 +895,9 @@ export async function createQwenStream(
         'bx-ua': fullHeaders['bx-ua'],
         'bx-umidtoken': fullHeaders['bx-umidtoken'],
         'bx-v': fullHeaders['bx-v'] || chatHeaders['bx-v'] || '',
+        ...(fullHeaders['authorization'] || chatHeaders['authorization']
+          ? { 'authorization': fullHeaders['authorization'] || chatHeaders['authorization'] }
+          : {}),
       };
       if (!uploadHeaders['bx-ua']) {
         console.warn('[Qwen] Missing bx-ua header for multimodal upload, attempting forced refresh...');
@@ -887,6 +907,7 @@ export async function createQwenStream(
         uploadHeaders['bx-ua'] = refreshedHeaders['bx-ua'];
         uploadHeaders['bx-umidtoken'] = refreshedHeaders['bx-umidtoken'];
         uploadHeaders['bx-v'] = refreshedHeaders['bx-v'] || uploadHeaders['bx-v'];
+        if (refreshedHeaders['authorization']) uploadHeaders['authorization'] = refreshedHeaders['authorization'];
       }
       assertAntiBotHeaders(uploadHeaders, 'Multimodal upload');
       const results = await Promise.all(

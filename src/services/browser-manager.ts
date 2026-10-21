@@ -190,11 +190,18 @@ export function listHeaderAccountIds(): string[] {
  * The same listener also records the `version` and `bx-v` headers the live
  * client sends, which keeps those constants in sync with the deployment.
  */
-export function installAccessTokenCapture(page: Page): { getToken: () => string | null } {
+export interface AccessTokenCapture {
+  /** Last token seen, whether or not it is still valid. */
+  getToken: () => string | null;
+  /** Resolves with the next token observed, or null on timeout. */
+  waitForToken: (timeoutMs?: number) => Promise<string | null>;
+}
+
+export function installAccessTokenCapture(page: Page): AccessTokenCapture {
   let accessToken: string | null = null;
+  const waiters: Array<(token: string | null) => void> = [];
 
   const handler = async (res: any) => {
-    if (accessToken) return;
     const url = res.url();
     if (!url.includes('auth.qwen.ai/api/v2/auths/refresh')) return;
     try {
@@ -203,6 +210,10 @@ export function installAccessTokenCapture(page: Page): { getToken: () => string 
       const token = json?.data?.access_token;
       if (typeof token === 'string' && token.length > 20) {
         accessToken = token;
+        while (waiters.length > 0) {
+          const resolve = waiters.shift();
+          resolve?.(token);
+        }
       }
     } catch {
       /* ignore non-JSON responses */
@@ -230,6 +241,22 @@ export function installAccessTokenCapture(page: Page): { getToken: () => string 
 
   return {
     getToken: () => accessToken,
+    waitForToken: (timeoutMs = 15000) => new Promise<string | null>((resolve) => {
+      if (accessToken) {
+        resolve(accessToken);
+        return;
+      }
+      const timer = setTimeout(() => {
+        const index = waiters.indexOf(onToken);
+        if (index >= 0) waiters.splice(index, 1);
+        resolve(null);
+      }, timeoutMs);
+      const onToken = (token: string | null) => {
+        clearTimeout(timer);
+        resolve(token);
+      };
+      waiters.push(onToken);
+    }),
   };
 }
 
@@ -264,6 +291,29 @@ export async function refreshQwenAccessToken(page: Page, timeoutMs = 15000): Pro
   } catch {
     return null;
   }
+}
+
+/**
+ * Renews the access token by letting the Qwen web client perform the
+ * refresh itself.
+ *
+ * The refresh endpoint only accepts requests that originate from the real
+ * web client: a request built by the proxy is rejected with "Invalid request
+ * header". Reloading the page makes the frontend issue the refresh call
+ * with its own headers, and the resulting token is captured from the
+ * response.
+ */
+export async function renewAccessTokenViaPage(page: Page, timeoutMs = 20000): Promise<string | null> {
+  const capture = installAccessTokenCapture(page);
+  const pending = capture.waitForToken(timeoutMs);
+
+  try {
+    await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+  } catch {
+    /* navigation errors are handled by the wait below */
+  }
+
+  return pending;
 }
 
 export function storageStatePath(accountId: string): string {

@@ -80,6 +80,7 @@ async function applyToAccount(accountId: string, email?: string): Promise<ApplyR
         'bx-v': headers.bxV || getBxVersion(),
         'bx-ua': headers.bxUa || '',
         'bx-umidtoken': headers.bxUmidtoken || '',
+        ...(headers.authorization ? { authorization: headers.authorization } : {}),
         source: 'web',
         cookie: headers.cookie,
         'User-Agent': headers.userAgent,
