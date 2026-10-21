@@ -68,21 +68,27 @@ function isWarmChatInFlight(accountId: string, chatId: string) {
 }
 
 async function getBasicQwenHeaders(accountId?: string): Promise<Record<string, string>> {
-  const { cookie, userAgent, bxV, bxUa, bxUmidtoken } = await getBasicHeaders(accountId);
+  const { cookie, userAgent, bxV, bxUa, bxUmidtoken, authorization } = await getBasicHeaders(accountId);
   if (!cookie || !userAgent || !bxV || !bxUa || !bxUmidtoken) {
     throw new Error('Missing required browser anti-bot headers for warm pool');
   }
-  return {
+  const headers: Record<string, string> = {
     cookie,
     'user-agent': userAgent,
     'bx-v': bxV,
     'bx-ua': bxUa,
     'bx-umidtoken': bxUmidtoken,
   };
+  if (authorization) {
+    headers['authorization'] = authorization;
+  } else {
+    console.warn(`[WarmPool] No authorization bearer token available for ${accountId}; browser path will rely on page-injected auth.`);
+  }
+  return headers;
 }
 
 function buildWarmPoolNodeHeaders(headers: Record<string, string>, accountId?: string): Record<string, string> {
-  return {
+  const result: Record<string, string> = {
     'accept': 'application/json, text/plain, */*',
     'content-type': 'application/json',
     'cookie': headers['cookie'],
@@ -99,8 +105,11 @@ function buildWarmPoolNodeHeaders(headers: Record<string, string>, accountId?: s
     'bx-ua': headers['bx-ua'],
     'bx-umidtoken': headers['bx-umidtoken'],
     'source': 'web',
-    ...getClientHintsHeaders(accountId),
   };
+  if (headers['authorization']) {
+    result['authorization'] = headers['authorization'];
+  }
+  return { ...result, ...getClientHintsHeaders(accountId) };
 }
 
 async function nodeJsonFetch<T>(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; timeoutMs?: number }): Promise<{ status: number; body: string; json: T | null }> {
@@ -198,8 +207,20 @@ async function createRealQwenChat(headers: Record<string, string>, accountId?: s
       throwIfErrorJson(json);
       return extractChatId(json);
     } catch (err: any) {
-      if (err instanceof QwenUpstreamError) throw err;
-      console.warn(`[WarmPool] Direct HTTP chat creation failed for ${accountId}, falling back to browser: ${err.message}`);
+      if (err instanceof QwenUpstreamError) {
+        if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
+          const hourHint = err.message?.match(/Wait about (\d+) hour/);
+          const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+          recordAccountBlock(accountId, 'rate-limited', err.message, { cooldownMs });
+          console.warn(`[WarmPool] Account ${accountId} rate-limited during chat creation. Quarantined.`);
+          throw err;
+        }
+        // For non-rate-limit errors (e.g. Unauthorized), fall through to browser path
+        // which sends cookies automatically and may have the Bearer token via page context.
+        console.warn(`[WarmPool] Direct HTTP chat creation failed for ${accountId}, falling back to browser: ${err.message}`);
+      } else {
+        console.warn(`[WarmPool] Direct HTTP chat creation failed for ${accountId}, falling back to browser: ${err.message}`);
+      }
     }
   }
 
@@ -207,15 +228,15 @@ async function createRealQwenChat(headers: Record<string, string>, accountId?: s
 
   if (page) {
     try {
+      // Browser path: use minimal headers. Cookies are sent automatically by
+      // the browser; Qwen's frontend adds anti-bot headers via its own fetch
+      // interceptor when navigating the UI.
       const result = await browserJsonFetch<any>(page, 'https://chat.qwen.ai/api/v2/chats/new', {
         method: 'POST',
         headers: {
-          'accept': 'application/json, text/plain, */*',
           'content-type': 'application/json',
           'x-request-id': crypto.randomUUID(),
           'timezone': CACHED_TIMEZONE,
-          'version': QWEN_WEB_VERSION,
-          'source': 'web',
         },
         body,
         timeoutMs: config.timeouts.http,
@@ -286,19 +307,13 @@ async function fetchUnusedChats(headers: Record<string, string>, accountId?: str
   }
 
   const page = await waitForAccountPage(accountId, 10000);
-  const reqHeaders: Record<string, string> = {
-    'accept': 'application/json, text/plain, */*',
-    'x-request-id': crypto.randomUUID(),
-    'timezone': CACHED_TIMEZONE,
-    'source': 'web',
-  };
 
   let body = '';
   if (page) {
     try {
       const result = await browserJsonFetch<any>(page, url, {
         method: 'GET',
-        headers: reqHeaders,
+        headers: buildWarmPoolNodeHeaders(headers, accountId),
         timeoutMs: config.timeouts.http,
       });
       if (result.status && result.status < 400) {

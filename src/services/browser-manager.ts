@@ -2,13 +2,13 @@ import type { Browser, BrowserContext, BrowserContextOptions, Page } from 'playw
 import { chromium, firefox, webkit } from 'playwright';
 import path from 'path';
 import fs from 'fs';
-import crypto from 'crypto';
 import type { QwenAccount } from '../core/accounts.js';
 import { config } from '../core/config.js';
 import { getBaseAccountId } from '../core/account-lanes.js';
-import { markAccountNotReady } from '../core/account-manager.js';
+import { markAccountNotReady, markAccountReady } from '../core/account-manager.js';
 import { getRuntimeInt, getRuntimeBool } from '../core/runtime-config.js';
 import { getStealthScript } from './stealth.js';
+import { solveAliyunWafCaptcha } from './captcha-solver.js';
 import { getFingerprintProfile, type FingerprintProfile } from './fingerprint.js';
 import { setFingerprintRotationListener } from '../core/account-isolation.js';
 import { sleep } from '../utils/sleep.js';
@@ -179,6 +179,72 @@ export function listHeaderAccountIds(): string[] {
   return [...accountHeaderCaches.keys()];
 }
 
+/**
+ * Installs a listener that captures the Qwen access token from the
+ * `auth.qwen.ai/api/v2/auths/refresh` response. Qwen's frontend calls this
+ * endpoint right after signin and the response body carries the JWT that is
+ * later sent as `authorization: Bearer <token>`. The token is NOT persisted in
+ * localStorage/cookies, so it has to be captured from the network response.
+ */
+export function installAccessTokenCapture(page: Page): { getToken: () => string | null } {
+  let accessToken: string | null = null;
+
+  const handler = async (res: any) => {
+    if (accessToken) return;
+    const url = res.url();
+    if (!url.includes('auth.qwen.ai/api/v2/auths/refresh')) return;
+    try {
+      const text = await res.text();
+      const json = JSON.parse(text);
+      const token = json?.data?.access_token;
+      if (typeof token === 'string' && token.length > 20) {
+        accessToken = token;
+      }
+    } catch {
+      /* ignore non-JSON responses */
+    }
+  };
+
+  page.on('response', handler);
+
+  return {
+    getToken: () => accessToken,
+  };
+}
+
+/**
+ * Forces a refresh of the Qwen access token and returns it. Requires the
+ * `refresh_token` cookie that is set by the signin flow.
+ *
+ * Uses the browser context's APIRequestContext, which shares the cookie jar
+ * but is not subject to CORS preflight rules the way page-context fetch is.
+ */
+export async function refreshQwenAccessToken(page: Page, timeoutMs = 15000): Promise<string | null> {
+  try {
+    const response = await page.context().request.get('https://auth.qwen.ai/api/v2/auths/refresh', {
+      headers: {
+        'accept': 'application/json',
+        'source': 'web',
+        'version': '0.3.20',
+        'x-request-origin': 'https://chat.qwen.ai',
+        'referer': 'https://chat.qwen.ai/',
+      },
+      timeout: timeoutMs,
+    });
+
+    const text = await response.text();
+    try {
+      const json = JSON.parse(text);
+      const token = json?.data?.access_token;
+      return typeof token === 'string' && token.length > 20 ? token : null;
+    } catch {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
 export function storageStatePath(accountId: string): string {
   return path.join(PROFILES_DIR, `${accountId}_state.json`);
 }
@@ -332,11 +398,47 @@ export function getUiMutex(accountId: string): Mutex {
   return m;
 }
 
+export async function checkSessionAuthenticated(page: Page | null): Promise<boolean> {
+  if (!page || page.isClosed()) return false;
+  try {
+    return await page.evaluate(async () => {
+      try {
+        const res = await fetch('/api/v2/users/status');
+        const data = await res.json();
+        return data?.data === true;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
 export async function hasValidAuthCookie(page: Page | null): Promise<boolean> {
-  if (!page) return false;
+  if (!page || page.isClosed()) return false;
   try {
     const cookies = await page.context().cookies();
-    return cookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
+    const hasCookie = cookies.some(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('session'));
+    if (hasCookie) return true;
+    const hasStorage = await page.evaluate(() => !!localStorage.getItem('token')).catch(() => false);
+    return hasStorage;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks for the `refresh_token` cookie, which is the only artifact that
+ * allows minting a fresh Qwen access token. The `users/status` endpoint can
+ * report an authenticated session using legacy cookies that can no longer
+ * obtain an access token, so it is not a reliable signal on its own.
+ */
+export async function hasRefreshTokenCookie(page: Page | null): Promise<boolean> {
+  if (!page || page.isClosed()) return false;
+  try {
+    const cookies = await page.context().cookies();
+    return cookies.some(c => c.name === 'refresh_token' && (c.expires === -1 || c.expires > Date.now() / 1000));
   } catch {
     return false;
   }
@@ -347,49 +449,98 @@ async function checkValidSession(): Promise<boolean> {
   try {
     const hasAuth = await hasValidAuthCookie(activePage);
     if (!hasAuth) return false;
-    await activePage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
-    const isLogged = !activePage.url().includes('auth') && !activePage.url().includes('login');
-    return isLogged;
+    await activePage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+    return await checkSessionAuthenticated(activePage);
   } catch {
     return false;
   }
 }
 
-async function loginToQwenWithContext(acctContext: BrowserContext, acctPage: Page, email: string, password: string): Promise<boolean> {
-  await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
+export async function loginToQwenWithContext(acctContext: BrowserContext, acctPage: Page, email: string, password: string): Promise<boolean> {
+  console.log(`[Playwright] Starting UI login for ${email}...`);
+  try {
+    await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+  } catch (err: any) {
+    console.warn(`[Playwright] Navigation to auth page warning: ${err.message}`);
+  }
+  await sleep(1000);
 
-  const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
+  // Only skip the interactive login when we still hold a refresh_token cookie,
+  // which is what allows minting a fresh access token. A session that only has
+  // legacy cookies passes /api/v2/users/status but cannot call the API.
+  if (await hasRefreshTokenCookie(acctPage) && await checkSessionAuthenticated(acctPage)) {
+    console.log(`[Playwright] Already authenticated for ${email}.`);
+    return true;
+  }
 
-  const result = await acctPage.evaluate(async ({ email, password }) => {
-    try {
-      const response = await fetch("https://chat.qwen.ai/api/v2/auths/signin", {
-        method: "POST",
-        headers: {
-          "accept": "application/json, text/plain, */*",
-          "content-type": "application/json",
-          "source": "web",
-          "timezone": new Date().toString().split(' (')[0],
-          "x-request-id": crypto.randomUUID()
-        },
-        body: JSON.stringify({ email, password, login_type: "email" })
-      });
-      const data = await response.json();
-      return { ok: response.ok, data };
-    } catch (e: any) {
-      return { ok: false, error: e.message };
+  // Switch to password login mode if on verification code mode
+  try {
+    const passwordBtn = acctPage.locator('button:has-text("senha"), button:has-text("password"), button:has-text("Password"), a:has-text("senha"), a:has-text("password")');
+    if (await passwordBtn.count() > 0 && await passwordBtn.first().isVisible().catch(() => false)) {
+      console.log(`[Playwright] Switching to password mode for ${email}...`);
+      await passwordBtn.first().click().catch(() => {});
+      await sleep(1000);
     }
-  }, { email, password: hashedPassword });
+  } catch (err: any) {
+    console.warn(`[Playwright] Error switching to password login: ${err.message}`);
+  }
 
-  if (result.ok) {
-    await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
-    const isLogged = !(acctPage.url().includes('auth') || acctPage.url().includes('login'));
-    if (isLogged) {
+  // Fill email and password in the UI inputs
+  const emailSel = 'input[name="email"], input[type="text"], input[type="email"]';
+  await acctPage.waitForSelector(emailSel, { timeout: config.timeouts.page });
+  await acctPage.fill(emailSel, email);
+  await sleep(300);
+
+  const passSel = 'input[name="password"], input[type="password"]';
+  await acctPage.waitForSelector(passSel, { timeout: config.timeouts.page });
+  await acctPage.fill(passSel, password);
+  await sleep(300);
+
+  // Click submit
+  console.log(`[Playwright] Submitting credentials for ${email}...`);
+  // Only target the real submit button. Text-based selectors such as
+  // "Fazer login" also match the login-mode tabs, which would silently
+  // prevent the form from being submitted.
+  const submitBtn = acctPage.locator('button.qwenchat-auth-pc-submit-button, button[type="submit"]');
+  if (await submitBtn.count() > 0) {
+    await submitBtn.first().click().catch(() => {});
+  } else {
+    await acctPage.keyboard.press('Enter');
+  }
+
+  // Wait for navigation away from auth page (signin processing)
+  try {
+    await acctPage.waitForURL(url => !url.href.includes('/auth') && !url.href.includes('/login'), { timeout: 15000 });
+  } catch {
+    /* navigation may not change URL if signin returns JSON */
+  }
+
+  // Poll for authentication or solve any Aliyun WAF captcha that appears
+  for (let i = 0; i < 25; i++) {
+    await sleep(1000);
+
+    const hasCaptcha = await acctPage.locator('#aliyunCaptcha-sliding-slider, #waf_nc_block').count() > 0;
+    if (hasCaptcha) {
+      console.log(`[Playwright] Aliyun captcha detected during login for ${email}, attempting solve...`);
+      await solveAliyunWafCaptcha(acctPage);
+    }
+
+    // The signin flow sets the refresh_token cookie; wait for it so the caller
+    // can mint an access token.
+    if (await hasRefreshTokenCookie(acctPage)) {
       console.log(`[Playwright] Login confirmed for ${email}.`);
       return true;
     }
+    if (await checkSessionAuthenticated(acctPage)) {
+      const url = acctPage.url();
+      if (!url.includes('/auth') && !url.includes('/login')) {
+        console.log(`[Playwright] Login confirmed for ${email}.`);
+        return true;
+      }
+    }
   }
 
-  console.error(`[Playwright] Login failed for ${email}:`, result.data || result.error);
+  console.error(`[Playwright] Login timed out or failed for ${email}`);
   return false;
 }
 
@@ -616,30 +767,86 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
   accountPages.set(account.id, acctPage);
   touchAccountActivity(account.id);
 
-  const hasAuth = await hasValidAuthCookie(acctPage);
+  // Capture the Qwen access token from the auth refresh response. Qwen's
+  // frontend calls auth.qwen.ai/api/v2/auths/refresh right after signin and
+  // the response body carries the JWT used as `authorization: Bearer <token>`.
+  const tokenCapture = installAccessTokenCapture(acctPage);
 
-  if (!hasAuth && account.email && account.password) {
-    await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+  const storeAccessToken = (token: string | null): boolean => {
+    if (!token) return false;
+    const cache = getAccountHeaderCache(account.id);
+    cache.currentHeaders['authorization'] = `Bearer ${token}`;
+    cache.lastHeadersTime = Date.now();
+    markAccountReady(account.id);
+    return true;
+  };
+
+  await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+
+  // Always attempt UI login when credentials are available. The Bearer token
+  // (authorization header) is only issued by the signin flow, so a cached
+  // session without a valid refresh_token cookie cannot produce API calls.
+  if (account.email && account.password) {
+    const ok = await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+    if (ok) {
+      // The signin flow triggers auth.qwen.ai/api/v2/auths/refresh, whose
+      // response body contains the access token.
+      for (let i = 0; i < 20; i++) {
+        if (tokenCapture.getToken()) break;
+        await sleep(500);
+      }
+      let token = tokenCapture.getToken();
+      if (!token) {
+        token = await refreshQwenAccessToken(acctPage);
+      }
+      if (storeAccessToken(token)) {
+        console.log(`[Playwright] Captured Qwen access token for ${account.email}.`);
+      } else {
+        console.warn(`[Playwright] Could not capture Qwen access token for ${account.email} after login.`);
+      }
+      await saveStorageState(acctContext, baseAccountId);
+    }
   }
 
   try {
     await acctPage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
     await dismissAgeModal(acctPage);
-    const url = acctPage.url();
-    if (url.includes('auth') || url.includes('login')) {
+    await sleep(1500);
+    const isAuth = await checkSessionAuthenticated(acctPage);
+    if (!isAuth) {
       if (account.email && account.password) {
-        console.log(`[Playwright] Session expired for ${account.email}, re-logging in...`);
-        await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
-        await acctPage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
-        await dismissAgeModal(acctPage);
+        console.log(`[Playwright] Session expired or unauthenticated for ${account.email}, logging in...`);
+        const ok = await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+        if (ok) {
+          await acctPage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+          await dismissAgeModal(acctPage);
+          await saveStorageState(acctContext, baseAccountId);
+        }
       } else {
         console.warn(`[Playwright] Session expired for account ${account.id} but no credentials available for re-login.`);
       }
     } else {
       console.log(`[Playwright] Session validated for ${account.email}.`);
+      await saveStorageState(acctContext, baseAccountId);
     }
   } catch (err: any) {
     console.warn(`[Playwright] Failed to validate session for ${account.email}: ${err.message}`);
+  }
+
+  // If we still have no access token (e.g. session was already valid and the
+  // refresh happened before the listener was installed), force a refresh.
+  if (!getAccountHeaderCache(account.id).currentHeaders['authorization']) {
+    for (let i = 0; i < 20; i++) {
+      if (tokenCapture.getToken()) break;
+      await sleep(500);
+    }
+    let token = tokenCapture.getToken();
+    if (!token) {
+      token = await refreshQwenAccessToken(acctPage);
+    }
+    if (storeAccessToken(token)) {
+      console.log(`[Playwright] Captured Qwen access token for ${account.email}.`);
+    }
   }
 
   if (await hasValidAuthCookie(acctPage)) {

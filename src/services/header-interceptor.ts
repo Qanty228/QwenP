@@ -1,3 +1,4 @@
+import type { Page } from 'playwright';
 import { config } from '../core/config.js';
 import { getActiveAccountCount, markAccountReady } from '../core/account-manager.js';
 import { getBaseAccountId } from '../core/account-lanes.js';
@@ -50,8 +51,83 @@ export async function getCookies(accountId?: string): Promise<string> {
   return cookieStr;
 }
 
-export async function getBasicHeaders(accountId?: string): Promise<{ cookie: string, userAgent: string, bxV: string, bxUa?: string, bxUmidtoken?: string }> {
-  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36', bxUa: 'mock-bx-ua', bxUmidtoken: 'mock-bx-umidtoken' };
+export async function extractAntiBotTokensFromPage(page: Page): Promise<{ bxUa: string; bxUmidtoken: string; authorization?: string }> {
+  try {
+    return await page.evaluate(async () => {
+      const w = window as any;
+      let bxUa = '';
+      try {
+        if (w.AWSC && w.AWSC.use) {
+          bxUa = await new Promise(resolve => {
+            w.AWSC.use('fy', (state: any, module: any) => {
+              if (state === 'loaded' && module?.getFYToken) {
+                resolve(module.getFYToken() || '');
+              } else {
+                resolve('');
+              }
+            });
+            setTimeout(() => resolve(''), 3000);
+          });
+        }
+      } catch {
+        /* ignore */
+      }
+
+      let bxUmidtoken = '';
+      try {
+        if (w.__awsc_et__?.getETToken) {
+          bxUmidtoken = w.__awsc_et__.getETToken() || '';
+        }
+      } catch {
+        /* ignore */
+      }
+
+      if (!bxUmidtoken) {
+        try {
+          if (w.AWSC && w.AWSC.use) {
+            bxUmidtoken = await new Promise(resolve => {
+              w.AWSC.use('umid', (state: any, module: any) => {
+                if (state === 'loaded' && module?.getSecurityToken) {
+                  resolve(module.getSecurityToken() || '');
+                } else {
+                  resolve('');
+                }
+              });
+              setTimeout(() => resolve(''), 2000);
+            });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+
+      // Try to find authorization Bearer token in localStorage
+      let authorization = '';
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (!key) continue;
+          const val = localStorage.getItem(key) || '';
+          if (key.toLowerCase().includes('token') || key.toLowerCase().includes('access')) {
+            if (val.startsWith('eyJ') || val.startsWith('Bearer ')) {
+              authorization = val.startsWith('Bearer ') ? val : `Bearer ${val}`;
+              break;
+            }
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+
+      return { bxUa, bxUmidtoken, authorization };
+    });
+  } catch {
+    return { bxUa: '', bxUmidtoken: '', authorization: '' };
+  }
+}
+
+export async function getBasicHeaders(accountId?: string): Promise<{ cookie: string, userAgent: string, bxV: string, bxUa?: string, bxUmidtoken?: string, authorization?: string }> {
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36', bxUa: 'mock-bx-ua', bxUmidtoken: 'mock-bx-umidtoken', authorization: 'Bearer mock' };
 
   let page = accountId ? accountPages.get(accountId) : getActivePage();
   if (accountId && !page) {
@@ -77,14 +153,37 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
   const cache = getAccountHeaderCache(cacheKey);
   let bxUa = cache.currentHeaders['bx-ua'];
   let bxUmidtoken = cache.currentHeaders['bx-umidtoken'];
-  const bxV = cache.currentHeaders['bx-v'] || '2.5.36';
+  let authorization = cache.currentHeaders['authorization'];
+  const bxV = cache.currentHeaders['bx-v'] || '2.5.37';
 
-  if (!bxUa || !bxUmidtoken) {
+  if (!bxUa || !bxUmidtoken || !authorization) {
+    // Fast path: extract directly from AWSC and __awsc_et__ on the page
+    const direct = await extractAntiBotTokensFromPage(page);
+    if (direct.bxUa && direct.bxUmidtoken && direct.authorization) {
+      bxUa = direct.bxUa;
+      bxUmidtoken = direct.bxUmidtoken;
+      authorization = direct.authorization;
+      cache.currentHeaders['bx-ua'] = bxUa;
+      cache.currentHeaders['bx-umidtoken'] = bxUmidtoken;
+      cache.currentHeaders['authorization'] = authorization;
+      cache.currentHeaders['bx-v'] = '2.5.37';
+      markAccountReady(cacheKey);
+      return {
+        cookie: await getCookies(accountId),
+        userAgent,
+        bxV: '2.5.37',
+        bxUa,
+        bxUmidtoken,
+        authorization,
+      };
+    }
+
     console.log(`[Playwright] Missing bx-ua/bx-umidtoken for ${cacheKey}, triggering header interception...`);
     try {
       const result = await getQwenHeaders(true, accountId);
       bxUa = result.headers['bx-ua'];
       bxUmidtoken = result.headers['bx-umidtoken'];
+      authorization = result.headers['authorization'] || authorization;
       markAccountReady(cacheKey);
       return {
         cookie: await getCookies(accountId),
@@ -92,17 +191,18 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
         bxV: result.headers['bx-v'] || bxV,
         bxUa,
         bxUmidtoken,
+        authorization,
       };
     } catch (err: any) {
       console.warn(`[Playwright] Failed to auto-recover headers for ${cacheKey}: ${err.message}`);
     }
   }
 
-  if (bxUa && bxUmidtoken) {
+  if (bxUa && bxUmidtoken && authorization) {
     markAccountReady(cacheKey);
   }
 
-  return { cookie, userAgent, bxV, bxUa, bxUmidtoken };
+  return { cookie, userAgent, bxV, bxUa, bxUmidtoken, authorization };
 }
 
 export async function getGuestHeaders(): Promise<Record<string, string>> {
@@ -356,21 +456,20 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
   }
 
   const currentUrl = page.url();
-  const isOnQwen = currentUrl.includes('chat.qwen.ai');
-  // Capturing headers on a specific chat page is fragile: if that chat is mid
-  // generation the send button is disabled, and repeating the same prompt can
-  // be deduplicated — so the completions request never fires and the head
-  // timeout kicks in (which then resets the profile). Always capture from a
-  // fresh new-chat page.
-  const isOnSpecificChat = isOnQwen && /\/c\/(?!new-chat)/.test(currentUrl);
+  const isOnNewChat = /\/c\//.test(currentUrl);
 
-  if (!isOnQwen || isOnSpecificChat) {
+  if (!isOnNewChat) {
     console.log(`[Playwright] Navigating to stable Qwen new-chat page for ${cacheKey}... (Current: ${currentUrl})`);
-    await page.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded' });
-    await dismissAgeModal(page);
+    try {
+      await page.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+      await dismissAgeModal(page);
+      await sleep(1500);
+    } catch (err: any) {
+      console.warn(`[Playwright] Warning navigating to new-chat: ${err.message}`);
+    }
   }
 
-  const isLoginPage = page.url().includes('login') || (await page.$('input[type="email"], input[placeholder*="Email"]'));
+  const isLoginPage = page.url().includes('login') || page.url().includes('auth') || (await page.$('input[name="email"], input[type="email"]'));
   if (isLoginPage) {
     if (!accountId) {
       const email = process.env.QWEN_EMAIL;
@@ -400,148 +499,119 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
         if (acctContext) {
           const pageForLogin = accountPages.get(accountId);
           if (pageForLogin) {
-            const hashedPassword = (await import('crypto')).createHash('sha256').update(creds.password).digest('hex');
-            await pageForLogin.evaluate(async ({ email, password }) => {
-              await fetch('https://chat.qwen.ai/api/v2/auths/signin', {
-                method: 'POST',
-                headers: {
-                  'accept': 'application/json, text/plain, */*',
-                  'content-type': 'application/json',
-                  'source': 'web',
-                  'timezone': new Date().toString().split(' (')[0],
-                  'x-request-id': crypto.randomUUID(),
-                },
-                body: JSON.stringify({ email, password, login_type: 'email' }),
-              });
-            }, { email: creds.email, password: hashedPassword });
+            const { loginToQwenWithContext, saveStorageState } = await import('./browser-manager.js');
+            const ok = await loginToQwenWithContext(acctContext, pageForLogin, creds.email, creds.password);
+            if (ok) {
+              await saveStorageState(acctContext, getBaseAccountId(accountId));
+              await pageForLogin.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded' }).catch(() => {});
+            }
           }
         }
       }
     }
   }
 
-  const watcher = startCaptchaWatcher(page, config.timeouts.headers);
-  try {
-    return await new Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }>((resolve, reject) => {
-      const timeout = setTimeout(async () => {
-        console.error(`[Playwright] Timeout waiting for Qwen headers for ${cacheKey}. Current URL:`, page.url());
-        try {
-          const path = await import('path');
-          const { PROFILES_DIR } = await import('./browser-manager.js');
-          const screenshotPath = path.join(PROFILES_DIR, `error_${cacheKey}.png`);
-          await page.screenshot({ path: screenshotPath });
-          console.log(`[Playwright] Error screenshot saved to ${screenshotPath}`);
-        } catch (err: any) {
-          console.error('[Playwright] Failed to save error screenshot:', err.message);
-        }
-        reject(new Error(`Timeout waiting for Qwen headers for ${cacheKey}`));
-      }, config.timeouts.headers);
+  // The Bearer token is issued by auth.qwen.ai/api/v2/auths/refresh, which
+  // requires the refresh_token cookie set during signin. Force a refresh to
+  // obtain a fresh access token.
+  let accessToken: string | null = cache.currentHeaders['authorization']
+    ? cache.currentHeaders['authorization'].replace(/^Bearer\s+/i, '')
+    : null;
 
-      console.log(`[Playwright] Setting up route interception for ${cacheKey}...`);
-      const routeHandler = async (route: any, request: any) => {
-        const reqHeaders = request.headers();
-        let uiSessionId = '';
-        let uiParentMessageId: string | null = null;
-
-        const postData = request.postData();
-        if (postData) {
-          try {
-            const payload = JSON.parse(postData);
-            if (payload.chat_id) {
-              uiSessionId = payload.chat_id;
-            }
-            if (payload.parent_id !== undefined) {
-              uiParentMessageId = payload.parent_id;
-            }
-          } catch { /* ignore parse errors */ }
-        }
-
-        const extractedHeaders = {
-          'cookie': reqHeaders['cookie'] || '',
-          'bx-ua': reqHeaders['bx-ua'] || '',
-          'bx-umidtoken': reqHeaders['bx-umidtoken'] || '',
-          'bx-v': reqHeaders['bx-v'] || '',
-          'x-request-id': reqHeaders['x-request-id'] || '',
-          'user-agent': reqHeaders['user-agent'] || ''
-        };
-
-        if (!extractedHeaders.cookie || !extractedHeaders['bx-ua']) {
-          console.log(`[Playwright] Intercepted request missing critical headers for ${cacheKey}, skipping...`);
-          await route.continue().catch(() => {});
-          return;
-        }
-
-        clearTimeout(timeout);
-
-        console.log(`[Playwright] Successfully intercepted headers for ${cacheKey}.`);
-        cache.currentHeaders = extractedHeaders;
-        cache.cachedQwenHeaders = { headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId };
-        cache.lastHeadersTime = Date.now();
-        cache.refreshInProgress = false;
-        markAccountReady(cacheKey);
-
-        import('./qwen.js').then(m => m.disableNativeTools(accountId).catch(() => {}));
-
-        await route.abort('aborted').catch(() => {});
-
-        await page.unroute('**/api/v2/chat/completions*', routeHandler).catch(() => {});
-
-        resolve(cache.cachedQwenHeaders);
-      };
-
-      page.route('**/api/v2/chat/completions*', routeHandler).then(async () => {
-        console.log(`[Playwright] Triggering request for ${cacheKey}...`);
-        const inputSelector = 'textarea.message-input-textarea, textarea:visible, [contenteditable="true"]:visible';
-        try {
-          await dismissAgeModal(page);
-          await page.waitForSelector(inputSelector, { timeout: config.timeouts.page });
-          await humanType(page, inputSelector, 'Hello');
-          console.log(`[Playwright] Typed human text for ${cacheKey}, waiting for UI to update...`);
-          await sleep(humanDelay(1500, 2500));
-
-          const selectors = [
-            '.message-input-right-button-send .send-button',
-            '.chat-prompt-send-button',
-            'button.send-button'
-          ];
-
-          let clicked = false;
-          for (const selector of selectors) {
-            try {
-              const btn = await page.$(selector);
-              if (btn && await btn.isVisible()) {
-                console.log(`[Playwright] Attempting click on: ${selector}`);
-
-                await page.evaluate((sel) => {
-                  const element = document.querySelector(sel) as HTMLElement;
-                  if (element) {
-                    element.focus();
-                    element.click();
-                  }
-                }, selector);
-
-                await btn.click({ force: true, delay: humanDelay(30, 80) }).catch(() => {});
-
-                clicked = true;
-                break;
-              }
-            } catch (e) {
-              console.error(`[Playwright] Error clicking ${selector} for ${cacheKey}:`, e);
-            }
-          }
-
-          if (!clicked) {
-            console.log(`[Playwright] No send button found/clicked for ${cacheKey}, fallback to Enter...`);
-            await page.focus(inputSelector);
-            await page.keyboard.press('Enter');
-          }
-        } catch (e) {
-          clearTimeout(timeout);
-          reject(e);
-        }
-      });
-    });
-  } finally {
-    watcher.stop();
+  if (!accessToken) {
+    const { refreshQwenAccessToken } = await import('./browser-manager.js');
+    accessToken = await refreshQwenAccessToken(page);
+    if (accessToken) {
+      console.log(`[Playwright] Refreshed Qwen access token for ${cacheKey}.`);
+    } else {
+      console.warn(`[Playwright] Could not refresh Qwen access token for ${cacheKey}.`);
+    }
   }
+
+  const directTokens = await extractAntiBotTokensFromPage(page);
+  if (directTokens.bxUa && directTokens.bxUmidtoken) {
+    const cookies = await getCookies(accountId);
+    let userAgent = cachedUserAgents.get(cacheKey);
+    if (!userAgent) {
+      userAgent = await page.evaluate(() => navigator.userAgent);
+      cachedUserAgents.set(cacheKey, userAgent);
+    }
+    const authorization = accessToken ? `Bearer ${accessToken}` : '';
+    const extractedHeaders = {
+      cookie: cookies,
+      'bx-ua': directTokens.bxUa,
+      'bx-umidtoken': directTokens.bxUmidtoken,
+      'bx-v': '2.5.37',
+      'user-agent': userAgent,
+      'x-request-id': '',
+      ...(authorization ? { 'authorization': authorization } : {}),
+    };
+    cache.currentHeaders = extractedHeaders;
+    cache.cachedQwenHeaders = { headers: extractedHeaders, chatSessionId: '', parentMessageId: null };
+    cache.lastHeadersTime = Date.now();
+    cache.refreshInProgress = false;
+    markAccountReady(cacheKey);
+    return cache.cachedQwenHeaders;
+  }
+
+  // Capture authorization Bearer token from page requests after navigation.
+  // After UI login and navigation to /c/new-chat, the page automatically includes
+  // authorization: Bearer on all API requests. We capture it via request listener,
+  // which is more reliable than route interception + button click.
+  let capturedHeaders: Record<string, string> | null = null;
+  const requestListener = (req: any) => {
+    const u = req.url();
+    if (!u.includes('chat.qwen.ai/api/v2') || u.includes('analytics') || u.includes('aplus') || u.includes('fourier.taobao')) return;
+    const h = req.headers();
+    if (h['authorization'] && h['bx-ua']) {
+      capturedHeaders = {
+        'cookie': h['cookie'] || '',
+        'bx-ua': h['bx-ua'] || '',
+        'bx-umidtoken': h['bx-umidtoken'] || '',
+        'bx-v': h['bx-v'] || '',
+        'x-request-id': h['x-request-id'] || '',
+        'user-agent': h['user-agent'] || '',
+        'authorization': h['authorization'] || ''
+      };
+    }
+  };
+
+  page.on('request', requestListener);
+
+  // Trigger a fetch from the page context. Qwen's frontend may add the
+  // authorization: Bearer header automatically via a fetch interceptor.
+  // The request listener above will capture it if present.
+  try {
+    await page.evaluate(async () => {
+      await fetch('/api/v2/users/status', {
+        method: 'GET',
+        headers: {
+          'accept': 'application/json',
+        },
+      });
+    }).catch(() => { /* ignore fetch errors */ });
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    // Wait up to 15 seconds for a request with authorization header
+    for (let i = 0; i < 30; i++) {
+      await sleep(500);
+      if (capturedHeaders) break;
+    }
+  } finally {
+    page.removeListener('request', requestListener);
+  }
+
+  if (capturedHeaders) {
+    cache.currentHeaders = capturedHeaders;
+    cache.cachedQwenHeaders = { headers: capturedHeaders, chatSessionId: '', parentMessageId: null };
+    cache.lastHeadersTime = Date.now();
+    cache.refreshInProgress = false;
+    markAccountReady(cacheKey);
+    return cache.cachedQwenHeaders;
+  }
+
+  throw new Error(`Failed to capture Qwen headers (authorization bearer token) for ${cacheKey}`);
 }

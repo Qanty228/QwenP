@@ -47,7 +47,7 @@ function buildBrowserCompletionHeaders(headers: Record<string, string>): Record<
 }
 
 function buildNodeCompletionHeaders(headers: Record<string, string>, chatId: string, accountId?: string): Record<string, string> {
-  return {
+  const result: Record<string, string> = {
     'accept': 'application/json',
     'accept-language': 'pt-BR,pt;q=0.9',
     'content-type': 'application/json',
@@ -68,6 +68,10 @@ function buildNodeCompletionHeaders(headers: Record<string, string>, chatId: str
     'source': 'web',
     ...getClientHintsHeaders(accountId),
   };
+  if (headers['authorization']) {
+    result['authorization'] = headers['authorization'];
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
