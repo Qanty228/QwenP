@@ -1,3 +1,10 @@
+## [1.34.3](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.2...v1.34.3) (2026-10-21)
+
+
+### Bug Fixes
+
+* restore Qwen login flow and model responses ([67e4a03](https://github.com/pedrofariasx/qwenproxy/commit/67e4a034a1738a57045cea83657a06b22d1f390e))
+
 ## [1.34.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.1...v1.34.2) (2026-10-17)
 
 
