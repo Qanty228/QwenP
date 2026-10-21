@@ -1,3 +1,10 @@
+# [1.35.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.3...v1.35.0) (2026-10-21)
+
+
+### Features
+
+* auto-detect Qwen web and Baxia versions at runtime ([0a78bd8](https://github.com/pedrofariasx/qwenproxy/commit/0a78bd8ea3f59ef0ef5db5e13878603bd3838711))
+
 ## [1.34.3](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.2...v1.34.3) (2026-10-21)
 
 
