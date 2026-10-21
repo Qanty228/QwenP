@@ -1,3 +1,10 @@
+# [1.36.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.35.1...v1.36.0) (2026-10-21)
+
+
+### Features
+
+* switch accounts when a model hits its daily limit ([23d8990](https://github.com/pedrofariasx/qwenproxy/commit/23d8990120109329cd82795e49e17a742387d3f1))
+
 ## [1.35.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.35.0...v1.35.1) (2026-10-21)
 
 
