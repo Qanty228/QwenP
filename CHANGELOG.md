@@ -1,3 +1,10 @@
+## [1.35.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.35.0...v1.35.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* renew expired Qwen access tokens instead of failing with Unauthorized ([415df1e](https://github.com/pedrofariasx/qwenproxy/commit/415df1e01cdbf7be0ae0e02104aa55ec086d23d1))
+
 # [1.35.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.3...v1.35.0) (2026-10-21)
 
 
