@@ -7,6 +7,8 @@ import { looksLikeUnwrappedToolCall, parseUnwrappedToolCalls } from './tool-hand
 import { textContainsToolCallStart } from '../tools/toolcall-tags.js';
 import { isDegenerateAnswer, canFastReleaseGuard } from '../utils/degenerate-answer.js';
 import { isOverloadMessage } from '../utils/overload-detector.js';
+import { isQuotaLimitMessage } from '../utils/quota-detector.js';
+import { getAccountCount } from '../core/account-manager.js';
 import { removeStream } from '../core/stream-registry.js';
 import { recordToolCall } from '../core/tool-call-debug.js';
 import { recordToolCallEmission } from '../core/tool-call-registry.js';
@@ -43,6 +45,12 @@ export interface StreamHandlerContext {
   onToolCallRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
   onUpdateMemberRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
   onOverloadRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
+  /**
+   * Called when the account ran out of the daily quota for the requested
+   * model. The proxy retries on another account with the same model, so the
+   * client never sees the limit notice.
+   */
+  onQuotaLimitRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
   /**
    * Called when a response was cut off / truncated (e.g. unclosed code fence or token limit)
    * to automatically continue generation on the same chat without requiring the user to send "continue".
@@ -219,6 +227,12 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       let updateMemberRetried = false;
       let sawOverloadSignal = false;
       let overloadRetried = false;
+      let sawQuotaLimitSignal = false;
+      // The daily limit is per account, so the request has to be able to walk
+      // through every account instead of giving up after the first one.
+      let quotaLimitRetriesLeft = ctx.onQuotaLimitRetry
+        ? Math.max(1, getAccountCount() + 1)
+        : 0;
       const estimatedPromptTokens = countTokens(ctx.finalPrompt);
       const fastWriteContent = (content: string) => {
         // Once a tool call has been streamed, never send more content chunks:
@@ -284,8 +298,12 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         updateMemberRetried = false;
         sawOverloadSignal = false;
         overloadRetried = false;
+        sawQuotaLimitSignal = false;
+        quotaLimitRetriesLeft = ctx.onQuotaLimitRetry
+          ? Math.max(1, getAccountCount() + 1)
+          : 0;
         heldOutput = '';
-        guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry || !!ctx.onOverloadRetry;
+        guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry || !!ctx.onOverloadRetry || !!ctx.onQuotaLimitRetry;
       };
 
       const readUpstream = async (stream: ReadableStream) => {
@@ -398,6 +416,11 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                   const newContent = delta.content || '';
                   if (!sawOverloadSignal && isOverloadMessage(newContent)) {
                     sawOverloadSignal = true;
+                  }
+                  // The daily-limit notice is delivered as regular answer text,
+                  // so it has to be recognised from the content itself.
+                  if (!sawQuotaLimitSignal && isQuotaLimitMessage(newContent)) {
+                    sawQuotaLimitSignal = true;
                   }
                   const result = getIncrementalDelta(lastFullContent, newContent, contentLength, contentSuffix);
                   vStr = result.delta;
@@ -523,6 +546,31 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         if (clientAborted()) return;
         overloadRetried = true;
         const retried = await ctx.onOverloadRetry();
+        if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
+          ctx.uiSessionId = retried.uiSessionId;
+          resetStreamState();
+          activeStream = retried.stream;
+          await readUpstream(retried.stream);
+          if (toolParser?.isInsideTool()) sawToolCallSignal = true;
+        }
+      }
+
+      // Daily quota guard: the account ran out of the daily limit for the
+      // requested model. Retry on another account with the same model so the
+      // client keeps using the model it asked for.
+      if (
+        ctx.onQuotaLimitRetry &&
+        quotaLimitRetriesLeft > 0 &&
+        (sawQuotaLimitSignal || isQuotaLimitMessage(lastFullContent))
+      ) {
+        if (clientAborted()) return;
+        quotaLimitRetriesLeft--;
+        console.warn('[Chat] Account daily model limit hit. Retrying with another account...');
+        const retried = await ctx.onQuotaLimitRetry();
         if (retried) {
           if (clientAborted()) {
             retried.stream.cancel('client aborted stream').catch(() => {});
@@ -701,6 +749,8 @@ export interface NonStreamingResult {
   degenerate: boolean;
   updateMember: boolean;
   overload: boolean;
+  /** True when the reply was the daily-limit notice for the model. */
+  quotaLimit: boolean;
   targetResponseId?: string | null;
   isTruncated?: boolean;
 }
@@ -781,6 +831,7 @@ export async function collectNonStreamingResult(
       degenerate: false,
       updateMember: false,
       overload: false,
+      quotaLimit: false,
     };
   }
 
@@ -837,6 +888,7 @@ export async function collectNonStreamingResult(
     degenerate: toolCallsOut.length === 0 && isDegenerateAnswer(finalContent),
     updateMember: parserState.updateMemberDetected,
     overload: parserState.overloadDetected,
+    quotaLimit: isQuotaLimitMessage(finalContent),
     targetResponseId: parserState.targetResponseId,
     isTruncated,
   };

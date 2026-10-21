@@ -82,6 +82,17 @@ function runMigrations(db: Database.Database): void {
       style TEXT NOT NULL DEFAULT 'Default',
       instruction TEXT NOT NULL DEFAULT ''
     );
+
+    CREATE TABLE IF NOT EXISTS account_model_limits (
+      account_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      until INTEGER NOT NULL,
+      reason TEXT NOT NULL DEFAULT 'MembershipLimit',
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (account_id, model)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_account_model_limits_account ON account_model_limits(account_id);
   `)
 
   try {
@@ -303,4 +314,52 @@ export function savePersonalizationRow(row: PersonalizationRow): void {
         instruction = excluded.instruction
     `)
     .run(row.name, row.description, row.style, row.instruction)
+}
+
+// Per-model quota limits. Qwen applies a daily limit per model, so an
+// account can be out of quota for one model while still serving others.
+
+export interface ModelLimitRow {
+  account_id: string
+  model: string
+  until: number
+  reason: string
+  updated_at: number
+}
+
+export function listPersistedModelLimits(): ModelLimitRow[] {
+  return getDatabase()
+    .prepare('SELECT account_id, model, until, reason, updated_at FROM account_model_limits')
+    .all() as ModelLimitRow[]
+}
+
+export function upsertModelLimit(entry: {
+  accountId: string
+  model: string
+  until: number
+  reason: string
+  updatedAt: number
+}): void {
+  getDatabase()
+    .prepare(`
+      INSERT INTO account_model_limits (account_id, model, until, reason, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, model) DO UPDATE SET
+        until = excluded.until,
+        reason = excluded.reason,
+        updated_at = excluded.updated_at
+    `)
+    .run(entry.accountId, entry.model, entry.until, entry.reason, entry.updatedAt)
+}
+
+export function deleteModelLimit(accountId: string, model: string): void {
+  getDatabase()
+    .prepare('DELETE FROM account_model_limits WHERE account_id = ? AND model = ?')
+    .run(accountId, model)
+}
+
+export function deleteModelLimitsForAccount(accountId: string): void {
+  getDatabase()
+    .prepare('DELETE FROM account_model_limits WHERE account_id = ?')
+    .run(accountId)
 }

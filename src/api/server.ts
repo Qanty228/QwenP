@@ -138,6 +138,15 @@ export async function startServer(overrides?: ServerOverrides): Promise<void> {
   const accounts = loadAccounts()
   accountCount = accounts.length
 
+  // Restore the per-model quota limits so accounts that are out of quota are
+  // not picked again right after a restart.
+  try {
+    const { loadModelLimits } = await import('../core/account-model-limits.js')
+    loadModelLimits()
+  } catch (err: any) {
+    console.warn('[Server] Failed to restore model limits:', err.message)
+  }
+
   if (!overrides?.quiet) {
     console.log(renderBanner({
       port: overrides?.port ?? Number(process.env.PORT || 3000),

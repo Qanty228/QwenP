@@ -110,6 +110,8 @@ function blockReason(type: BlockType): string {
     case 'flagged': return 'Flagged';
     case 'cookie-invalid': return 'CookieInvalid';
     case 'overload': return 'Overload';
+    case 'membership-limit': return 'MembershipLimit';
+    case 'server-error': return 'ServerError';
     default: return 'ServerError';
   }
 }

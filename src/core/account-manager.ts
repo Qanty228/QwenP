@@ -2,6 +2,7 @@ import type { QwenAccount} from './accounts.js';
 import { loadAccounts, updateAccountCooldown, invalidateAccountsCache as invalidateAccountsCacheSource } from './accounts.js'
 import { config } from './config.js'
 import { getBaseAccountId, makeAccountLaneId } from './account-lanes.js'
+import { getModelLimitRemainingMs, isAccountModelLimited } from './account-model-limits.js'
 import { RetryableQwenStreamError } from '../services/error-handler.js'
 import { getRuntimeInt } from './runtime-config.js'
 import { metrics } from './metrics.js'
@@ -354,7 +355,7 @@ export function getAccountById(accountId: string): QwenAccount | null {
   return accounts.find(a => a.id === accountId) ?? null
 }
 
-export function getNextAccount(forceReset?: boolean): QwenAccount | null {
+export function getNextAccount(forceReset?: boolean, modelId?: string): QwenAccount | null {
   const accounts = getAccountsWithCooldownSync()
   if (accounts.length === 0) {
     return null
@@ -368,9 +369,11 @@ export function getNextAccount(forceReset?: boolean): QwenAccount | null {
   for (let i = 0; i < accounts.length; i++) {
     const account = accounts[currentIndex % accounts.length]
     currentIndex = (currentIndex + 1) % accounts.length
-    if (!isAccountOnCooldown(account.id) && !isAccountInUse(account.id)) {
-      viable.push(account)
-    }
+    if (isAccountOnCooldown(account.id) || isAccountInUse(account.id)) continue
+    // An account out of quota for this model is still healthy for the other
+    // models, so it is skipped here instead of being quarantined entirely.
+    if (modelId && isAccountModelLimited(account.id, modelId)) continue
+    viable.push(account)
   }
 
   if (viable.length > 0) {
@@ -402,6 +405,23 @@ export function getNextAccount(forceReset?: boolean): QwenAccount | null {
     return null
   }
 
+  // Every account is out of quota for this model. Trying the one whose limit
+  // expires first is still better than failing outright: the quota may have
+  // been reset upstream, or the notice may not apply to this account.
+  if (modelId) {
+    const modelBlocked = accounts.filter(
+      a => isAccountModelLimited(a.id, modelId) && !isAccountOnCooldown(a.id) && !isAccountInUse(a.id),
+    )
+    if (modelBlocked.length > 0) {
+      const soonest = modelBlocked.reduce((best, a) => {
+        const bestRemaining = getModelLimitRemainingMs(best.id, modelId)
+        const candidateRemaining = getModelLimitRemainingMs(a.id, modelId)
+        return candidateRemaining < bestRemaining ? a : best
+      }, modelBlocked[0])
+      return soonest
+    }
+  }
+
   // All accounts on cooldown — return the one with the shortest remaining cooldown
   let best: QwenAccount | null = null
   let bestRemaining = Infinity
@@ -415,7 +435,7 @@ export function getNextAccount(forceReset?: boolean): QwenAccount | null {
   return best
 }
 
-export function getNextAvailableAccount(triedAccountIds?: Set<string> | string): QwenAccount | null {
+export function getNextAvailableAccount(triedAccountIds?: Set<string> | string, modelId?: string): QwenAccount | null {
   const accounts = getAccountsWithCooldownSync()
   if (accounts.length === 0) return null
 
@@ -434,6 +454,9 @@ export function getNextAvailableAccount(triedAccountIds?: Set<string> | string):
     const account = accounts[idx]
     if (triedSet.has(account.id)) continue
     if (!isAccountOnCooldown(account.id) && !isAccountInUse(account.id)) {
+      // Skip accounts that are out of quota for this model; they stay usable
+      // for the other models.
+      if (modelId && isAccountModelLimited(account.id, modelId)) continue
       candidates.push(account)
     }
   }

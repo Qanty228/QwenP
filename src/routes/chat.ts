@@ -7,6 +7,7 @@ import { getModelContextWindow } from '../core/model-registry.js'
 import { truncateMessages, estimateTokenCount } from '../utils/context-truncation.js';
 import { OVERLOAD_COOLDOWN_MS } from '../utils/overload-detector.js';
 import { getNextAccount, getNextAvailableAccount, getAccountById, onAccountFreed, getAccountCooldownInfo, markAccountInUse, releaseAccountInUse, getInUseAccounts } from '../core/account-manager.js';
+import { markAccountModelLimited } from '../core/account-model-limits.js';
 import { loadAccounts } from '../core/accounts.js';
 import { registerStream, removeStream, getStream } from '../core/stream-registry.js';
 import { metrics } from '../core/metrics.js'
@@ -30,6 +31,25 @@ function msUntilMidnight(): number {
   tomorrow.setDate(tomorrow.getDate() + 1);
   tomorrow.setHours(0, 0, 0, 0);
   return tomorrow.getTime() - now.getTime();
+}
+
+/**
+ * Records that an account ran out of the daily quota for a model.
+ *
+ * The limit is scoped to the model: the account stays fully usable for every
+ * other model, so the proxy can keep serving them while the daily limit
+ * expires.
+ */
+function registerModelQuotaLimit(accountId: string, model: string, detail?: string): void {
+  const until = Date.now() + msUntilMidnight();
+  markAccountModelLimited(accountId, model, until, 'MembershipLimit');
+  console.warn(
+    `[Chat] Account ${accountId} reached the daily limit for model ${model}. ` +
+    `The model is blocked for this account until the daily reset; other models are unaffected.`,
+  );
+  if (detail) {
+    console.warn(`[Chat] Upstream notice: ${detail.slice(0, 200)}`);
+  }
 }
 import { getSession, resolveSessionKey } from '../services/session-manager.js';
 import { lookupToolCall } from '../core/tool-call-registry.js';
@@ -480,8 +500,8 @@ export async function chatCompletions(c: Context) {
       }
 
       let account = sessionKey
-        ? (getAccountById(session?.accountId ?? '') ?? getNextAccount())
-        : getNextAccount();
+        ? (getAccountById(session?.accountId ?? '') ?? getNextAccount(false, modelId))
+        : getNextAccount(false, modelId);
       const triedAccountIds = new Set<string>();
 
       if (!account) {
@@ -503,7 +523,7 @@ export async function chatCompletions(c: Context) {
               freed.promise,
             ]);
             freed.cancel();
-            account = getNextAccount();
+            account = getNextAccount(false, modelId);
           }
           console.log(`[Chat] Waited ${Date.now() - waitStart}ms for a free lane`);
         }
@@ -520,7 +540,7 @@ export async function chatCompletions(c: Context) {
         const mustBootstrap = requiresCrossAccountBootstrap(accountId, session?.accountId);
 
         if (triedAccountIds.has(accountId)) {
-          account = getNextAvailableAccount(triedAccountIds);
+          account = getNextAvailableAccount(triedAccountIds, modelId);
           continue;
         }
         triedAccountIds.add(accountId);
@@ -528,7 +548,7 @@ export async function chatCompletions(c: Context) {
         const cooldownInfo = getAccountCooldownInfo(accountId);
         if (cooldownInfo && accountId !== 'global') {
           console.log(`[Chat] Skipping account ${accountEmail} (${accountId}) — on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`);
-          account = getNextAvailableAccount(triedAccountIds);
+          account = getNextAvailableAccount(triedAccountIds, modelId);
           continue;
         }
 
@@ -622,7 +642,7 @@ export async function chatCompletions(c: Context) {
           break;
         }
 
-        account = getNextAvailableAccount(triedAccountIds);
+        account = getNextAvailableAccount(triedAccountIds, modelId);
       }
 
       removeStream(completionId);
@@ -684,6 +704,13 @@ export async function chatCompletions(c: Context) {
       if (completed.status === 200 && completed.updateMember) {
         console.warn('[Chat] Account membership limit hit in non-streaming mode. Retrying with another account...');
         recordAccountBlock(acquired.accountId, 'membership-limit', undefined, { cooldownMs: msUntilMidnight() });
+        const retried = await obtainStream(finalPrompt, true);
+        completed = await collectResponse(retried.stream, retried.uiSessionId);
+      }
+
+      if (completed.status === 200 && completed.quotaLimit) {
+        console.warn('[Chat] Account daily model limit hit in non-streaming mode. Retrying with another account...');
+        registerModelQuotaLimit(acquired.accountId, modelId, completed.content);
         const retried = await obtainStream(finalPrompt, true);
         completed = await collectResponse(retried.stream, retried.uiSessionId);
       }
@@ -780,6 +807,14 @@ export async function chatCompletions(c: Context) {
       onUpdateMemberRetry: async () => {
         console.warn('[Chat] Account membership limit hit. Retrying with another account...');
         recordAccountBlock(acquired.accountId, 'membership-limit', undefined, { cooldownMs: msUntilMidnight() });
+        const retried = await obtainStream(finalPrompt, true);
+        return { stream: retried.stream, uiSessionId: retried.uiSessionId };
+      },
+      onQuotaLimitRetry: async () => {
+        // The account exhausted the daily quota of the requested model. The
+        // limit only applies to that model, so the account stays available for
+        // the others and the request continues on another account.
+        registerModelQuotaLimit(acquired.accountId, modelId, undefined);
         const retried = await obtainStream(finalPrompt, true);
         return { stream: retried.stream, uiSessionId: retried.uiSessionId };
       },

@@ -24,6 +24,7 @@ import {
   getReadyAccountCount,
 } from '../core/account-manager.js'
 import { getIsolationStatus, getFingerprintSalt, getResourceVersion } from '../core/account-isolation.js'
+import { clearAllAccountModelLimits, listModelLimits } from '../core/account-model-limits.js'
 import { getFingerprintProfile } from '../services/fingerprint.js'
 import { makeAccountLaneId } from '../core/account-lanes.js'
 import { getPersonalization, savePersonalization, applyPersonalizationToAccount, applyPersonalizationToAll, hasPersonalization } from '../services/personalization.js'
@@ -300,6 +301,7 @@ adminApp.get('/api/live', adminGuard, (c) => {
 // --- Accounts ---------------------------------------------------------------
 
 adminApp.get('/api/accounts', adminGuard, (c) => {
+  const modelLimits = listModelLimits()
   const accounts = listAccounts().map(a => ({
     ...a,
     password: '***',
@@ -307,6 +309,9 @@ adminApp.get('/api/accounts', adminGuard, (c) => {
     cooldownReason: getAccountCooldownInfo(a.id)?.reason ?? null,
     activeLoad: getAccountActiveLoad(a.id),
     ready: isAccountReady(a.id),
+    modelLimits: modelLimits
+      .filter(l => l.accountId === a.id)
+      .map(l => ({ model: l.model, remainingMs: Math.max(0, l.until - Date.now()), reason: l.reason })),
   }))
   return c.json({ accounts, inUse: [...getInUseAccounts()], maxStreamsPerAccount: config.accounts.maxStreamsPerAccount })
 })
@@ -386,6 +391,9 @@ adminApp.post('/api/accounts/:id/clear-cooldown', adminGuard, (c) => {
   // first) and the persisted DB row. updateAccountCooldown(id,0,null) would
   // only clear the DB and leave the account stuck on cooldown in memory.
   clearAccountCooldown(c.req.param('id'))
+  // Also clear the per-model daily limits so the account is usable again for
+  // every model.
+  clearAllAccountModelLimits(c.req.param('id'))
   return c.json({ ok: true })
 })
 
@@ -475,7 +483,10 @@ adminApp.get('/api/debug/toolcalls', adminGuard, (c) => {
 
 adminApp.post('/api/clear-cooldowns', adminGuard, (c) => {
   const accounts = listAccounts()
-  for (const a of accounts) clearAccountCooldown(a.id)
+  for (const a of accounts) {
+    clearAccountCooldown(a.id)
+    clearAllAccountModelLimits(a.id)
+  }
   return c.json({ ok: true, cleared: accounts.length })
 })
 
