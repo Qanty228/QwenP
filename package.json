@@ -20,7 +20,16 @@
     "test:e2e": "tsx --test src/tests/e2e/*.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
-    "lint:fix": "eslint src/ --fix"
+    "lint:fix": "eslint src/ --fix",
+    "docker:verify": "node scripts/check-docker-versions.mjs",
+    "docker:build": "npm run docker:verify && docker compose build",
+    "docker:up": "npm run docker:verify && docker compose up -d && docker compose ps",
+    "docker:down": "docker compose down",
+    "docker:restart": "docker compose restart",
+    "docker:logs": "docker compose logs -f",
+    "docker:shell": "docker compose exec qwenproxy sh",
+    "docker:health": "docker compose ps && docker inspect --format='{{json .State.Health}}' qwenproxy 2>/dev/null || true",
+    "docker:clean": "docker compose down -v --remove-orphans"
   },
   "keywords": [
     "openai",

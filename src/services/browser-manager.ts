@@ -780,20 +780,32 @@ export async function closePlaywright() {
     cache.refreshInProgress = false;
   }
   if (context) {
-    if (await hasValidAuthCookie(activePage)) {
-      await saveStorageState(context, '_default');
-    }
-    await context.close();
+    const ctx = context;
     context = null;
     activePage = null;
+    try {
+      if (await hasValidAuthCookie(activePage)) {
+        await saveStorageState(ctx, '_default');
+      }
+    } catch {
+      /* the browser may already be gone */
+    }
+    // The browser can be closed before this runs (crash, forced shutdown);
+    // closing an already closed context must not abort the shutdown.
+    await ctx.close().catch(() => {});
   }
   if (guestContext) {
-    if (await hasValidAuthCookie(guestPage)) {
-      await saveStorageState(guestContext, '_guest');
-    }
-    await guestContext.close();
+    const gctx = guestContext;
     guestContext = null;
     guestPage = null;
+    try {
+      if (await hasValidAuthCookie(guestPage)) {
+        await saveStorageState(gctx, '_guest');
+      }
+    } catch {
+      /* the browser may already be gone */
+    }
+    await gctx.close().catch(() => {});
   }
   for (const acctId of accountContexts.keys()) {
     await closePlaywrightForAccount(acctId);
@@ -975,10 +987,14 @@ export async function closePlaywrightForAccount(accountId: string) {
   const acctContext = accountContexts.get(accountId);
   const acctPage = accountPages.get(accountId);
   if (acctContext) {
-    if (await hasValidAuthCookie(acctPage || null)) {
-      await saveStorageState(acctContext, accountId);
+    try {
+      if (await hasValidAuthCookie(acctPage || null)) {
+        await saveStorageState(acctContext, accountId);
+      }
+    } catch {
+      /* the browser may already be gone */
     }
-    await acctContext.close();
+    await acctContext.close().catch(() => {});
   }
   accountContexts.delete(accountId);
   accountPages.delete(accountId);
