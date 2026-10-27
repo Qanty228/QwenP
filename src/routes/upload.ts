@@ -53,6 +53,7 @@ async function getSTSToken(
           "bx-ua": headers["bx-ua"],
           "bx-umidtoken": headers["bx-umidtoken"],
           "bx-v": headers["bx-v"],
+          ...(headers["authorization"] ? { Authorization: headers["authorization"] } : {}),
         },
         body: JSON.stringify({ filename, filesize: String(filesize), filetype }),
       },
@@ -113,6 +114,7 @@ async function refreshUploadHeaders(): Promise<Record<string, string> | null> {
         "bx-ua": qHeaders['bx-ua'] || '',
         "bx-umidtoken": qHeaders['bx-umidtoken'] || '',
         "bx-v": qHeaders['bx-v'] || '',
+        ...(qHeaders['authorization'] ? { authorization: qHeaders['authorization'] } : {}),
       };
     }
   } catch (err: any) {
@@ -299,6 +301,7 @@ export async function uploadFile(c: Context) {
           "bx-ua": qHeaders['bx-ua'] || '',
           "bx-umidtoken": qHeaders['bx-umidtoken'] || '',
           "bx-v": qHeaders['bx-v'] || '',
+          ...(qHeaders['authorization'] ? { authorization: qHeaders['authorization'] } : {}),
         };
       }
     } catch (err: any) {

@@ -138,6 +138,15 @@ export async function startServer(overrides?: ServerOverrides): Promise<void> {
   const accounts = loadAccounts()
   accountCount = accounts.length
 
+  // Restore the per-model quota limits so accounts that are out of quota are
+  // not picked again right after a restart.
+  try {
+    const { loadModelLimits } = await import('../core/account-model-limits.js')
+    loadModelLimits()
+  } catch (err: any) {
+    console.warn('[Server] Failed to restore model limits:', err.message)
+  }
+
   if (!overrides?.quiet) {
     console.log(renderBanner({
       port: overrides?.port ?? Number(process.env.PORT || 3000),
@@ -240,11 +249,21 @@ export async function startServer(overrides?: ServerOverrides): Promise<void> {
     watchdog.stop()
     stopTimeSeriesSampling()
     metrics.stopCollection()
-    await cache.close()
-    const { closePlaywright } = await import('../services/playwright.js')
-    await closePlaywright()
-    const { closeDatabase } = await import('../core/database.js')
-    closeDatabase()
+    await cache.close().catch(() => {});
+    // Every step is best-effort: a failure here must not keep the container
+    // alive until the orchestrator sends SIGKILL.
+    try {
+      const { closePlaywright } = await import('../services/playwright.js')
+      await closePlaywright();
+    } catch (err: any) {
+      console.warn('[Server] Error while closing the browser:', err.message);
+    }
+    try {
+      const { closeDatabase } = await import('../core/database.js')
+      closeDatabase()
+    } catch (err: any) {
+      console.warn('[Server] Error while closing the database:', err.message);
+    }
     await new Promise<void>(resolve => {
       if (!server) return resolve()
       server.close(() => resolve())

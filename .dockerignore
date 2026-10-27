@@ -1,8 +1,10 @@
 # Dependencies
 node_modules/
+web/node_modules/
 
 # Build
 dist/
+web/dist/
 
 # Environment
 .env
@@ -19,6 +21,11 @@ accounts.json.bak
 # Browser profiles (session data)
 qwen_profiles/
 
+# Docker files are inputs, not part of the runtime image
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
 # Logs
 *.log
 npm-debug.log*
@@ -31,6 +38,7 @@ npm-debug.log*
 README.md
 LICENSE
 AGENTS.md
+docs/
 
 # CI/CD
 .github/

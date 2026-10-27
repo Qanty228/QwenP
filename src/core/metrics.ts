@@ -58,6 +58,7 @@ export class Metrics extends EventEmitter {
       ['watchdog.recovery.triggered', 'counter', 'Recovery attempts triggered'],
       ['watchdog.recovery.success', 'counter', 'Successful recoveries'],
       ['watchdog.recovery.failed', 'counter', 'Failed recoveries'],
+      ['accounts.stale_slots_swept', 'counter', 'Concurrency slots force-released by the stale-slot sweeper'],
     ]
 
     for (const [name, type, help] of defaults) {

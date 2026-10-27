@@ -3,43 +3,56 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: qwenproxy
+      args:
+        # Keep in sync with the `playwright` dependency in package.json.
+        # `npm run docker:verify` validates this.
+        PLAYWRIGHT_VERSION: "1.60.0"
+    image: qwenproxy:local
     ports:
-      # Match BOTH sides to PORT: o container escuta na mesma PORT que o .env
-      # injeta (env_file). Antes, PORT=3001 no .env mapeava 3001->3000 e o
-      # healthcheck quebrava.
+      # Both sides use the same PORT: the container listens on the port the
+      # .env injects. Mapping 3001->3000 used to break the healthcheck.
       - "${PORT:-3000}:${PORT:-3000}"
     env_file:
-      # Carrega toda a config de runtime do .env. Opcional — sem .env o servidor
-      # sobe com os defaults do schema Zod (mas sem contas/quota configuradas).
-      - path: .env
-        required: false
+      # Plain list form on purpose: the `path:`/`required:` mapping needs
+      # Compose v2.24+, and this keeps older installs working.
+      - .env
+    environment:
+      # Overrides whatever the .env declares, so the container always binds
+      # the port it is published on.
+      PORT: "${PORT:-3000}"
+      HOST: "0.0.0.0"
+      # Where the SQLite database and the browser profiles live.
+      USER_DATA_DIR: "/app/qwen_profiles"
+      # Bind-mounted host directories are owned by the host user. PUID/PGID
+      # let the entrypoint remap the unprivileged account to those ids.
+      # Empty = keep the account shipped in the image.
+      PUID: "${PUID:-}"
+      PGID: "${PGID:-}"
     volumes:
-      # SQLite (sessões/cooldowns/usuários) + perfis de browser persistidos.
+      # SQLite (sessions/cooldowns/users) + persistent browser profiles.
       - qwenproxy_data:/app/data
       - qwenproxy_profiles:/app/qwen_profiles
       - type: tmpfs
         target: /tmp
         tmpfs:
-          size: 536870912
+          # Chromium needs scratch space; keep it in RAM but bounded.
+          size: "${DOCKER_TMPFS_SIZE:-1073741824}"
     restart: unless-stopped
-    shm_size: '1gb'
+    # Chromium needs a large /dev/shm; the default 64MB crashes it.
+    shm_size: "${DOCKER_SHM_SIZE:-1gb}"
+    # `deploy.resources` is only honoured by Swarm — plain `docker compose up`
+    # silently ignores it, so the limits are declared the Compose v2 way.
+    mem_limit: "${DOCKER_MEMORY_LIMIT:-4g}"
+    cpus: "${DOCKER_CPUS:-2.0}"
+    # Give the server time to drain in-flight streams before SIGKILL.
+    stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          # Cada context chromium consome ~300-600MB. Suba para 6-8g se usar
-          # várias contas/lanes em paralelo.
-          memory: 4g
-          cpus: '2.0'
-        reservations:
-          memory: 1g
     healthcheck:
-      # /health só responde após o boot completo (pre-captura de headers de
-      # todas as contas com stagger). start_period de 120s evita restarts falsos
-      # com várias contas. Usa ${PORT} para casar com o override acima.
-      test: ["CMD", "node", "-e", "fetch('http://localhost:${PORT:-3000}/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      # /health only answers after the full boot (per-account header
+      # pre-capture with stagger), so the start period is generous to avoid
+      # false restarts with several accounts.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3

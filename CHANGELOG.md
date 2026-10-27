@@ -1,3 +1,73 @@
+# [1.37.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.36.1...v1.37.0) (2026-10-21)
+
+
+### Features
+
+* improve Docker compatibility, ergonomics and documentation ([00a7ae7](https://github.com/pedrofariasx/qwenproxy/commit/00a7ae7cc0f938cd36ba250ddafd4a56dbfe9e6e))
+
+## [1.36.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.36.0...v1.36.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* hide the daily-limit notice from the client while failing over ([6fec584](https://github.com/pedrofariasx/qwenproxy/commit/6fec5847b5589cfd889f7ba4601d12eb1119e340))
+
+# [1.36.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.35.1...v1.36.0) (2026-10-21)
+
+
+### Features
+
+* switch accounts when a model hits its daily limit ([23d8990](https://github.com/pedrofariasx/qwenproxy/commit/23d8990120109329cd82795e49e17a742387d3f1))
+
+## [1.35.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.35.0...v1.35.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* renew expired Qwen access tokens instead of failing with Unauthorized ([415df1e](https://github.com/pedrofariasx/qwenproxy/commit/415df1e01cdbf7be0ae0e02104aa55ec086d23d1))
+
+# [1.35.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.3...v1.35.0) (2026-10-21)
+
+
+### Features
+
+* auto-detect Qwen web and Baxia versions at runtime ([0a78bd8](https://github.com/pedrofariasx/qwenproxy/commit/0a78bd8ea3f59ef0ef5db5e13878603bd3838711))
+
+## [1.34.3](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.2...v1.34.3) (2026-10-21)
+
+
+### Bug Fixes
+
+* restore Qwen login flow and model responses ([67e4a03](https://github.com/pedrofariasx/qwenproxy/commit/67e4a034a1738a57045cea83657a06b22d1f390e))
+
+## [1.34.2](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.1...v1.34.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **warm-pool:** detect TMD/captcha challenges and quarantine accounts ([1392cfb](https://github.com/pedrofariasx/qwenproxy/commit/1392cfb8257760daae52c889b829e67ecbf567a6))
+
+## [1.34.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.34.0...v1.34.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* account lane wait loop and SSE [DONE] framing ([72f2f00](https://github.com/pedrofariasx/qwenproxy/commit/72f2f00b22d287d33c98bdccbe70924338ba8d3f))
+
+# [1.34.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.33.1...v1.34.0) (2026-10-07)
+
+
+### Features
+
+* detect Qwen overload responses and auto-retry on another account ([f9b1cba](https://github.com/pedrofariasx/qwenproxy/commit/f9b1cbaa32bf3f32b7d6636975683ce5aaa05f72))
+
+## [1.33.1](https://github.com/pedrofariasx/qwenproxy/compare/v1.33.0...v1.33.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* handle age confirmation modal during account init and header capture ([e2e40e1](https://github.com/pedrofariasx/qwenproxy/commit/e2e40e1154c2970497c891088fbf835846242b78))
+
 # [1.33.0](https://github.com/pedrofariasx/qwenproxy/compare/v1.32.2...v1.33.0) (2026-09-25)
 
 

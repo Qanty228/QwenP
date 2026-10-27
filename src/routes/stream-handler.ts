@@ -6,6 +6,9 @@ import { getIncrementalDelta, parseQwenErrorPayload } from './sse-parser.js';
 import { looksLikeUnwrappedToolCall, parseUnwrappedToolCalls } from './tool-handler.js';
 import { textContainsToolCallStart } from '../tools/toolcall-tags.js';
 import { isDegenerateAnswer, canFastReleaseGuard } from '../utils/degenerate-answer.js';
+import { isOverloadMessage } from '../utils/overload-detector.js';
+import { isQuotaLimitMessage } from '../utils/quota-detector.js';
+import { getAccountCount } from '../core/account-manager.js';
 import { removeStream } from '../core/stream-registry.js';
 import { recordToolCall } from '../core/tool-call-debug.js';
 import { recordToolCallEmission } from '../core/tool-call-registry.js';
@@ -41,6 +44,13 @@ export interface StreamHandlerContext {
    */
   onToolCallRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
   onUpdateMemberRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
+  onOverloadRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
+  /**
+   * Called when the account ran out of the daily quota for the requested
+   * model. The proxy retries on another account with the same model, so the
+   * client never sees the limit notice.
+   */
+  onQuotaLimitRetry?: () => Promise<{ stream: ReadableStream; uiSessionId: string } | null>;
   /**
    * Called when a response was cut off / truncated (e.g. unclosed code fence or token limit)
    * to automatically continue generation on the same chat without requiring the user to send "continue".
@@ -76,8 +86,29 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
     // the upstream stream ends. A degenerate final answer can then be discarded
     // and regenerated before the client ever sees it.
     const GUARD_HOLD_BYTES = 800;
-    let guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry;
+    let guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry || !!ctx.onOverloadRetry;
     let heldOutput = '';
+
+    let activeStream: ReadableStream | null = ctx.stream;
+    let activeReader: ReadableStreamDefaultReader<any> | null = null;
+    const clientSignal = (c.req.raw as any)?.signal as AbortSignal | undefined;
+    const clientAborted = () => !!clientSignal?.aborted;
+    const releaseActiveStream = (reason: string) => {
+      const r = activeReader;
+      const s = activeStream;
+      activeStream = null;
+      activeReader = null;
+      if (r) {
+        r.cancel(reason).catch(() => {});
+      } else {
+        s?.cancel(reason).catch(() => {});
+      }
+    };
+    const onClientAbort = () => releaseActiveStream('client aborted stream');
+    if (clientSignal) {
+      if (clientSignal.aborted) queueMicrotask(onClientAbort);
+      else clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    }
 
     const releaseGuard = () => {
       if (!guardActive) return;
@@ -86,6 +117,20 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         writeBuffer = heldOutput + writeBuffer;
         heldOutput = '';
       }
+    };
+
+    /**
+     * Drops everything buffered for the current attempt.
+     *
+     * Used when the attempt is abandoned (quota limit, overload, degenerate
+     * answer): the partial output of the failed attempt must never reach the
+     * client, otherwise the user sees the failure notice followed by the
+     * successful answer.
+     */
+    const discardBufferedOutput = () => {
+      heldOutput = '';
+      writeBuffer = '';
+      if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
     };
 
     const flushWrites = () => {
@@ -194,6 +239,14 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       let firstPayloadFlushed = false;
       let sawUpdateMemberSignal = false;
       let updateMemberRetried = false;
+      let sawOverloadSignal = false;
+      let overloadRetried = false;
+      let sawQuotaLimitSignal = false;
+      // The daily limit is per account, so the request has to be able to walk
+      // through every account instead of giving up after the first one.
+      let quotaLimitRetriesLeft = ctx.onQuotaLimitRetry
+        ? Math.max(1, getAccountCount() + 1)
+        : 0;
       const estimatedPromptTokens = countTokens(ctx.finalPrompt);
       const fastWriteContent = (content: string) => {
         // Once a tool call has been streamed, never send more content chunks:
@@ -238,7 +291,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       completionTokens = 0;
       promptTokens = estimatedPromptTokens;
 
-      const resetStreamState = () => {
+      const resetStreamState = (options?: { keepQuotaRetries?: boolean }) => {
         _reasoningBuffer = '';
         lastFullContent = '';
         contentLength = 0;
@@ -257,38 +310,55 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         firstPayloadFlushed = false;
         sawUpdateMemberSignal = false;
         updateMemberRetried = false;
+        sawOverloadSignal = false;
+        overloadRetried = false;
+        sawQuotaLimitSignal = false;
+        // The quota retry budget spans the whole request: it must not be
+        // restored on every attempt, otherwise a request whose accounts are all
+        // out of quota would loop forever.
+        if (!options?.keepQuotaRetries) {
+          quotaLimitRetriesLeft = ctx.onQuotaLimitRetry
+            ? Math.max(1, getAccountCount() + 1)
+            : 0;
+        }
         heldOutput = '';
-        guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry;
+        guardActive = !!ctx.onDegenerateRetry || !!ctx.onToolCallRetry || !!ctx.onUpdateMemberRetry || !!ctx.onOverloadRetry || !!ctx.onQuotaLimitRetry;
       };
 
       const readUpstream = async (stream: ReadableStream) => {
-        const reader = stream.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const decoded = decoder.decode(value, { stream: true });
-          bufferChunks.push(decoded);
-          bufferLen += decoded.length;
+        const reader = stream.getReader() as ReadableStreamDefaultReader<any>;
+        activeReader = reader;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const decoded = decoder.decode(value, { stream: true });
+            bufferChunks.push(decoded);
+            bufferLen += decoded.length;
 
-          if (decoded.includes('\n')) {
-            const fullBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
-            processLines(fullBuffer);
+            if (decoded.includes('\n')) {
+              const fullBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
+              processLines(fullBuffer);
 
-            const remaining = fullBuffer.substring(lineStart);
-            bufferChunks.length = 0;
-            if (remaining) {
-              bufferChunks.push(remaining);
-              bufferLen = remaining.length;
-            } else {
-              bufferLen = 0;
+              const remaining = fullBuffer.substring(lineStart);
+              bufferChunks.length = 0;
+              if (remaining) {
+                bufferChunks.push(remaining);
+                bufferLen = remaining.length;
+              } else {
+                bufferLen = 0;
+              }
+              lineStart = 0;
             }
-            lineStart = 0;
           }
-        }
 
-        if (bufferLen > 0) {
-          const finalBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
-          processLines(finalBuffer);
+          if (bufferLen > 0) {
+            const finalBuffer = bufferChunks.length === 1 ? bufferChunks[0] : bufferChunks.join('');
+            processLines(finalBuffer);
+          }
+        } finally {
+          activeReader = null;
+          try { reader.releaseLock(); } catch { /* ignore */ }
         }
       };
 
@@ -363,6 +433,14 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                 isThinkingChunk = false;
                 if (delta.content !== undefined) {
                   const newContent = delta.content || '';
+                  if (!sawOverloadSignal && isOverloadMessage(newContent)) {
+                    sawOverloadSignal = true;
+                  }
+                  // The daily-limit notice is delivered as regular answer text,
+                  // so it has to be recognised from the content itself.
+                  if (!sawQuotaLimitSignal && isQuotaLimitMessage(newContent)) {
+                    sawQuotaLimitSignal = true;
+                  }
                   const result = getIncrementalDelta(lastFullContent, newContent, contentLength, contentSuffix);
                   vStr = result.delta;
                   if (vStr) {
@@ -384,7 +462,12 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                 }
                 fastWriteReasoning(vStr);
               } else {
-                if (guardActive && canFastReleaseGuard(lastFullContent)) {
+                // The daily-limit notice is a long, well-formed sentence, so
+                // it would pass the "substantive answer" fast-release check and
+                // reach the client before the quota signal is evaluated. Keep
+                // the guard closed while a quota notice is still possible.
+                const quotaStillPossible = ctx.onQuotaLimitRetry && !sawQuotaLimitSignal;
+                if (guardActive && !sawOverloadSignal && !quotaStillPossible && canFastReleaseGuard(lastFullContent)) {
                   releaseGuard();
                 }
                 if (ctx.hasTools && toolParser) {
@@ -433,11 +516,18 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         emittedStreamingToolIds.size === 0 &&
         isDegenerateAnswer(lastFullContent)
       ) {
+        if (clientAborted()) return;
         console.warn(`[Chat] Streaming degenerate reply detected (${JSON.stringify(lastFullContent.slice(0, 40))}). Regenerating...`);
         const retried = await ctx.onDegenerateRetry();
         if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -456,15 +546,72 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         sawToolCallSignal &&
         guardActive
       ) {
+        if (clientAborted()) return;
         console.warn('[Chat] Tool call attempted but unparseable. Regenerating with corrective directive...');
         toolCallRetried = true;
         const retried = await ctx.onToolCallRetry();
         if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
+      }
+
+      if (
+        ctx.onOverloadRetry &&
+        !overloadRetried &&
+        (sawOverloadSignal || isOverloadMessage(lastFullContent))
+      ) {
+        if (clientAborted()) return;
+        overloadRetried = true;
+        const retried = await ctx.onOverloadRetry();
+        if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
+          ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
+          resetStreamState();
+          activeStream = retried.stream;
+          await readUpstream(retried.stream);
+          if (toolParser?.isInsideTool()) sawToolCallSignal = true;
+        }
+      }
+
+      // Daily quota guard: the account ran out of the daily limit for the
+      // requested model. Retry on another account with the same model so the
+      // client keeps using the model it asked for.
+      //
+      // This is a loop because the next account may be out of quota too: the
+      // request walks through the accounts until one can serve the model.
+      while (
+        ctx.onQuotaLimitRetry &&
+        quotaLimitRetriesLeft > 0 &&
+        (sawQuotaLimitSignal || isQuotaLimitMessage(lastFullContent))
+      ) {
+        if (clientAborted()) return;
+        quotaLimitRetriesLeft--;
+        console.warn('[Chat] Account daily model limit hit. Retrying with another account...');
+        const retried = await ctx.onQuotaLimitRetry();
+        if (!retried) break;
+        if (clientAborted()) {
+          retried.stream.cancel('client aborted stream').catch(() => {});
+          return;
+        }
+        ctx.uiSessionId = retried.uiSessionId;
+        discardBufferedOutput();
+        resetStreamState({ keepQuotaRetries: true });
+        activeStream = retried.stream;
+        await readUpstream(retried.stream);
+        if (toolParser?.isInsideTool()) sawToolCallSignal = true;
       }
 
       // Membership-limit guard: the upstream account hit a membership/usage
@@ -476,12 +623,19 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         sawUpdateMemberSignal &&
         guardActive
       ) {
+        if (clientAborted()) return;
         console.warn('[Chat] Account membership limit hit. Retrying with another account...');
         updateMemberRetried = true;
         const retried = await ctx.onUpdateMemberRetry();
         if (retried) {
+          if (clientAborted()) {
+            retried.stream.cancel('client aborted stream').catch(() => {});
+            return;
+          }
           ctx.uiSessionId = retried.uiSessionId;
+          discardBufferedOutput();
           resetStreamState();
+          activeStream = retried.stream;
           await readUpstream(retried.stream);
           if (toolParser?.isInsideTool()) sawToolCallSignal = true;
         }
@@ -502,9 +656,15 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       ) {
         autoContinuesLeft--;
         console.warn(`[Chat] Truncated response detected (unclosed code fence or finish_reason=length). Auto-continuing stream (${config.autoContinue.maxContinues - autoContinuesLeft}/${config.autoContinue.maxContinues})...`);
+        if (clientAborted()) break;
         const continued = await ctx.onAutoContinue(ctx.uiSessionId, targetResponseId || '');
         if (!continued) break;
+        if (clientAborted()) {
+          continued.stream.cancel('client aborted stream').catch(() => {});
+          break;
+        }
         ctx.uiSessionId = continued.uiSessionId;
+        activeStream = continued.stream;
         bufferChunks = [];
         bufferLen = 0;
         lineStart = 0;
@@ -601,6 +761,8 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       flushWrites();
       markHistoryComplete(ctx.uiSessionId);
     } finally {
+      if (clientSignal) clientSignal.removeEventListener('abort', onClientAbort);
+      releaseActiveStream('stream teardown');
       flushWrites();
       clearInterval(heartbeatInterval);
       removeStream(ctx.completionId);
@@ -617,6 +779,9 @@ export interface NonStreamingResult {
   toolCalls: any[];
   degenerate: boolean;
   updateMember: boolean;
+  overload: boolean;
+  /** True when the reply was the daily-limit notice for the model. */
+  quotaLimit: boolean;
   targetResponseId?: string | null;
   isTruncated?: boolean;
 }
@@ -696,6 +861,8 @@ export async function collectNonStreamingResult(
       toolCalls: [],
       degenerate: false,
       updateMember: false,
+      overload: false,
+      quotaLimit: false,
     };
   }
 
@@ -751,6 +918,8 @@ export async function collectNonStreamingResult(
     toolCalls: toolCallsOut,
     degenerate: toolCallsOut.length === 0 && isDegenerateAnswer(finalContent),
     updateMember: parserState.updateMemberDetected,
+    overload: parserState.overloadDetected,
+    quotaLimit: isQuotaLimitMessage(finalContent),
     targetResponseId: parserState.targetResponseId,
     isTruncated,
   };

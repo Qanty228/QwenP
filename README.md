@@ -96,7 +96,27 @@ npx playwright install
 ### Via Docker
 
 ```bash
-docker-compose up -d
+git clone https://github.com/pedrofariasx/qwenproxy.git
+cd qwenproxy
+
+cp .env.example .env   # configure API_KEY e as credenciais QWEN_EMAIL/QWEN_PASSWORD
+
+docker compose up -d
+docker compose logs -f
+```
+
+O painel admin fica em `http://localhost:3000/admin`.
+
+Use `docker compose` (v2), não `docker-compose` (v1). O guia completo —
+bind mounts, PUID/PGID, limites de memória, backup e troubleshooting — está
+em **[docs/DOCKER.md](docs/DOCKER.md)**.
+
+Atalhos via npm:
+
+```bash
+npm run docker:up      # build + up
+npm run docker:logs    # logs em tempo real
+npm run docker:shell   # shell dentro do container
 ```
 
 ---
@@ -354,42 +374,51 @@ estoura o limite recebe `429` com a mensagem correspondente.
 
 ## Deploy com Docker
 
-### docker-compose.yml
-
-```yaml
-services:
-  qwenproxy:
-    build: .
-    container_name: qwenproxy
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
-    env_file:
-      - path: .env
-        required: false
-    volumes:
-      - qwenproxy_data:/app/data
-      - qwenproxy_profiles:/app/qwen_profiles
-    restart: unless-stopped
-    shm_size: '1gb'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-volumes:
-  qwenproxy_data:
-  qwenproxy_profiles:
+```bash
+cp .env.example .env   # configure API_KEY e as credenciais QWEN_EMAIL/QWEN_PASSWORD
+docker compose up -d
 ```
+
+O servidor responde em `http://localhost:3000` e o painel admin em
+`http://localhost:3000/admin`.
+
+### O que a imagem já resolve
+
+- **Playwright com navegador** — a imagem base oficial traz Chromium, Firefox
+  e WebKit com todas as dependências de sistema.
+- **Permissões** — o entrypoint ajusta a ownership dos volumes no startup e
+  aceita `PUID`/`PGID` para bind mounts do host.
+- **Chromium estável** — `/dev/shm` de 1 GB e `--no-sandbox`, sem precisar de
+  `--privileged`.
+- **Healthcheck** — a imagem define `HEALTHCHECK`; o Compose também o
+  configura, com `start_period` generoso para o boot multi-conta.
+- **Shutdown gracioso** — `SIGTERM` é encaminhado e o servidor drena as
+  streams em voo antes de sair.
 
 ### Volumes persistentes
 
-| Volume               | Conteúdo                                                             |
-| -------------------- | -------------------------------------------------------------------- |
-| `qwenproxy_data`     | Banco SQLite: contas, usuários (API keys) e sessões (`qwenproxy.db`) |
-| `qwenproxy_profiles` | Perfis de navegador por conta (cookies, sessões)                     |
+| Volume               | Caminho no container | Conteúdo                                        |
+| -------------------- | --------------------- | ----------------------------------------------- |
+| `qwenproxy_data`     | `/app/data`           | SQLite: contas, API keys, sessões, cooldowns    |
+| `qwenproxy_profiles` | `/app/qwen_profiles`  | Perfis de navegador por conta (cookies, sessão) |
 
-O container ajusta automaticamente as permissões desses volumes no startup. Se usar bind mounts locais em vez dos volumes nomeados acima, garanta que os diretórios montados sejam graváveis pelo container.
+### Comandos
+
+```bash
+npm run docker:up       # build + up
+npm run docker:logs     # logs em tempo real
+npm run docker:shell    # shell dentro do container
+npm run docker:health   # status + health
+npm run docker:down     # derrubar
+npm run docker:clean    # derrubar e APAGAR os volumes
+```
+
+### Documentação completa
+
+Ajuste de memória e CPUs, bind mounts, `PUID`/`PGID`, backup/restauração,
+`docker run` sem Compose, compatibilidade de versões e **troubleshooting**
+(permissões, porta em uso, loop de reinício, `Executable doesn't exist`) —
+tudo em **[docs/DOCKER.md](docs/DOCKER.md)**.
 
 ---
 
