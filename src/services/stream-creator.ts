@@ -1,8 +1,9 @@
 import { getQwenHeaders, getGuestHeaders, getPageForAccount, waitForAccountPage, browserStreamFetch } from './playwright.js';
 import { MAX_PAYLOAD_SIZE } from '../core/model-registry.js';
 import { config } from '../core/config.js';
-import { RetryableQwenStreamError, QwenUpstreamError, handleErrorBody, handleJsonErrorBody } from './error-handler.js';
+import { RetryableQwenStreamError, QwenUpstreamError, handleErrorBody, handleJsonErrorBody, isExpiredTokenError } from './error-handler.js';
 import { getWarmedChat, releaseWarmChat } from './warm-pool.js';
+import { recoverHeadersFromUnauthorized } from './access-token-manager.js';
 import { getClientHintsHeaders } from './browser-manager.js';
 import type { Page } from 'playwright';
 import { releaseAccountInUse, acquireAccountStreamSlot } from '../core/account-manager.js';
@@ -620,6 +621,11 @@ export async function createQwenStream(
   let chatHeaders: Record<string, string>;
   let leasedChat: any;
   let leasedChatReleased = false;
+  // Snapshot of the resolved request, captured right before the completion is
+  // sent. Used by the expired-token recovery path in the catch below, which
+  // must be able to replay the request even when it failed before chat/headers
+  // were fully assigned.
+  let retrySnapshot: { chatId: string; headers: Record<string, string>; payloadJson: string; timeoutMs: number } | null = null;
   const streamLockKey = effectiveAccountId || 'global';
   // Reserve a concurrency slot for the real account. All lanes share one
   // budget, so requests queue here (up to the configured wait) instead of
@@ -996,6 +1002,8 @@ export async function createQwenStream(
 
     const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
 
+    retrySnapshot = { chatId, headers: chatHeaders, payloadJson, timeoutMs };
+
     // Direct fast path: POST from Node with the captured anti-bot headers,
     // skipping both the CDP bridge and the page-readiness wait. Anything but a
     // clean SSE success falls back to the browser relay below, and the
@@ -1216,6 +1224,73 @@ export async function createQwenStream(
     return { stream: wrapLeasedStream(response.body, controller, timeoutMs, `Qwen stream ${chatId}`), headers: chatHeaders, uiSessionId: chatId, controller, accountId: returnAccountKey };
   } catch (err) {
     releaseStreamResources();
+
+    // Upstream rejected the bearer token ("unauthorized: Token has expired").
+    // Renew it and replay the completion once with fresh headers and a fresh
+    // warm-pool chat, instead of surfacing a permanent Error 502 to the client.
+    if (retrySnapshot && isExpiredTokenError(err)) {
+      const retryAcctKey = effectiveAccountId || 'global';
+      let retrySlot: Awaited<ReturnType<typeof acquireAccountStreamSlot>> | null = null;
+      let retryLeasedChat: any = null;
+      let retryResourcesReleased = false;
+      const releaseRetryResources = () => {
+        if (retryResourcesReleased) return;
+        retryResourcesReleased = true;
+        if (retryLeasedChat) {
+          releaseWarmChat(retryLeasedChat.accountId, retryLeasedChat.chatId);
+          releaseAccountInUse(retryLeasedChat.accountId);
+        }
+        retrySlot?.release();
+      };
+      try {
+        console.log(`[Qwen] Expired access token rejected by upstream for ${retryAcctKey}; renewing and retrying once...`);
+        const recoveredHeaders = await recoverHeadersFromUnauthorized(effectiveAccountId, retrySnapshot.headers)
+          ?? (await getQwenHeaders(true, effectiveAccountId)).headers;
+        retrySlot = await acquireAccountStreamSlot(retryAcctKey, getRuntimeInt('ACCOUNT_STREAM_SLOT_WAIT_MS', config.accounts.streamSlotWaitMs));
+        retryLeasedChat = await getWarmedChat(accountId);
+        const retryChatId: string = retryLeasedChat.chatId;
+        const retryHeaders: Record<string, string> = retryLeasedChat.headers && !hasExpiredBearerToken(retryLeasedChat.headers)
+          ? retryLeasedChat.headers
+          : recoveredHeaders;
+        const retryPayloadJson = JSON.stringify({
+          ...JSON.parse(retrySnapshot.payloadJson),
+          chat_id: retryChatId,
+          messages: JSON.parse(retrySnapshot.payloadJson).messages.map((m: any) => ({ ...m, timestamp: Math.floor(Date.now() / 1000) })),
+        });
+        const retryUrl = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${retryChatId}`;
+        const retryController = new AbortController();
+        const retryResponse = await fetch(retryUrl, {
+          method: 'POST',
+          headers: buildNodeCompletionHeaders(retryHeaders, retryChatId, effectiveAccountId),
+          body: retryPayloadJson,
+          signal: retryController.signal,
+        });
+        const retryContentType = retryResponse.headers.get('content-type') || '';
+        if (retryResponse.ok && retryContentType.includes('text/event-stream') && retryResponse.body) {
+          return {
+            stream: addIdleTimeoutToStream(
+              retryResponse.body as ReadableStream<Uint8Array>,
+              retryController,
+              retrySnapshot.timeoutMs,
+              `Qwen stream ${retryChatId} (token-renewed)`,
+              () => retryController.abort(),
+              () => releaseRetryResources(),
+              () => retrySlot?.touch(),
+            ),
+            headers: retryHeaders,
+            uiSessionId: retryChatId,
+            controller: retryController,
+            accountId: retryLeasedChat.accountId || retryAcctKey,
+          };
+        }
+        const retryBody = await retryResponse.text().catch(() => '');
+        handleErrorBody(retryBody, retryResponse.status);
+      } catch (retryErr) {
+        releaseRetryResources();
+        console.warn(`[Qwen] Retry after token renewal did not succeed: ${(retryErr as Error).message}`);
+      }
+    }
+
     throw err;
   }
 }

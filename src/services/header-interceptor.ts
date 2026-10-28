@@ -2,8 +2,7 @@ import type { Page } from 'playwright';
 import { config } from '../core/config.js';
 import { QWEN_BX_VERSION_FALLBACK } from '../utils/qwen-constants.js';
 import { getBxVersion, refreshQwenVersions } from './qwen-versions.js';
-import { applyBearerToken, renewAccessToken } from './access-token-manager.js';
-import { hasExpiredBearerToken } from '../utils/access-token.js';
+import { hasExpiredBearerToken, isBearerTokenExpired } from '../utils/access-token.js';
 import { getActiveAccountCount, markAccountReady } from '../core/account-manager.js';
 import { getBaseAccountId } from '../core/account-lanes.js';
 import {
@@ -130,6 +129,71 @@ export async function extractAntiBotTokensFromPage(page: Page): Promise<{ bxUa: 
   }
 }
 
+/**
+ * Renews the bearer token held in an account's header cache.
+ *
+ * Lives here (instead of in access-token-manager) because it needs both the
+ * live page and the header caches; access-token-manager imports this module,
+ * so keeping the renewal logic on this side avoids a circular import.
+ * Returns the new `authorization` header value, or null when no page is
+ * available or the refresh cookie was rejected (full signin required).
+ */
+export async function renewAccountToken(accountId?: string, page?: Page): Promise<string | null> {
+  const cacheKey = accountId || 'global';
+  const target = page ?? accountPages.get(cacheKey) ?? (accountId ? undefined : getActivePage());
+  if (!target) return null;
+
+  // Lazy import keeps the module graph acyclic: browser-manager pulls in this
+  // file through session-keeper flows at runtime.
+  const { refreshQwenAccessToken, renewAccessTokenViaPage } = await import('./browser-manager.js');
+
+  // The refresh endpoint only accepts requests coming from the real web
+  // client, so the direct request is tried first and the page reload is the
+  // fallback that lets the frontend perform the refresh itself.
+  let token = await refreshQwenAccessToken(target);
+  if (!token) {
+    token = await renewAccessTokenViaPage(target);
+  }
+  if (!token) return null;
+
+  const authorization = `Bearer ${token}`;
+  applyRenewedTokenToCaches(cacheKey, authorization);
+  return authorization;
+}
+
+/**
+ * Replaces the bearer token inside a header set, keeping every other header
+ * untouched. Used to upgrade headers that were captured before a renewal.
+ */
+export function applyBearerToken(headers: Record<string, string>, authorization: string): Record<string, string> {
+  return { ...headers, authorization };
+}
+
+/**
+ * Propagates a freshly renewed bearer token to every long-lived copy the
+ * proxy keeps — the cached header set, the warm pool entries and the pinned
+ * sessions. Without this, a renewal would fix only the header cache while
+ * warm chats and sessions keep replaying the dead token, which makes upstream
+ * answer "unauthorized: Token has expired" on a permanent basis.
+ */
+export function applyRenewedTokenToCaches(cacheKey: string, authorization: string): void {
+  const cache = getAccountHeaderCache(cacheKey);
+  cache.currentHeaders['authorization'] = authorization;
+  cache.lastHeadersTime = Date.now();
+  if (cache.cachedQwenHeaders) {
+    cache.cachedQwenHeaders = {
+      ...cache.cachedQwenHeaders,
+      headers: applyBearerToken(cache.cachedQwenHeaders.headers, authorization),
+    };
+  }
+  import('./warm-pool.js')
+    .then(m => m.upgradeWarmPoolAuthorization(cacheKey, authorization))
+    .catch(() => {});
+  import('./session-manager.js')
+    .then(m => m.upgradeSessionAuthorization(cacheKey, authorization))
+    .catch(() => {});
+}
+
 export async function getBasicHeaders(accountId?: string): Promise<{ cookie: string, userAgent: string, bxV: string, bxUa?: string, bxUmidtoken?: string, authorization?: string }> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: QWEN_BX_VERSION_FALLBACK, bxUa: 'mock-bx-ua', bxUmidtoken: 'mock-bx-umidtoken', authorization: 'Bearer mock' };
 
@@ -163,7 +227,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
   // A cached access token expires after 15 minutes. Renew it up-front so
   // callers never receive headers that upstream would reject.
   if (authorization && hasExpiredBearerToken({ authorization })) {
-    const renewed = await renewAccessToken(accountId, page);
+    const renewed = await renewAccountToken(accountId, page);
     if (renewed) {
       authorization = renewed;
       cache.currentHeaders['authorization'] = renewed;
@@ -338,7 +402,7 @@ export async function getQwenHeaders(forceNew = false, accountId?: string): Prom
     // A cached access token expires after 15 minutes, well before the header
     // cache TTL. Renew it instead of serving a token that no longer works.
     if (hasExpiredBearerToken(cache.cachedQwenHeaders.headers)) {
-      const renewed = await renewAccessToken(accountId);
+      const renewed = await renewAccountToken(accountId);
       if (renewed) {
         cache.cachedQwenHeaders = {
           ...cache.cachedQwenHeaders,
