@@ -145,6 +145,24 @@ export function removeSession(sessionKey: string): void {
   try { deleteSession(sessionKey); } catch { /* ignore */ }
 }
 
+/**
+ * Replaces the bearer token stored in every persisted session of an account.
+ * Sessions live up to 24h while the access token lasts ~15 minutes, so after a
+ * renewal all session header copies must be upgraded — otherwise economical
+ * requests replay the dead token and upstream keeps answering "unauthorized:
+ * Token has expired" (surfaced as Error 502).
+ */
+export function upgradeSessionAuthorization(accountId: string, authorization: string): void {
+  loadSessionsFromDb();
+  for (const [key, entry] of sessions.entries()) {
+    if (entry.accountId !== accountId) continue;
+    if (!entry.headers || entry.headers['authorization'] === authorization) continue;
+    const updated: SessionEntry = { ...entry, headers: { ...entry.headers, authorization } };
+    sessions.set(key, updated);
+    persistSession(key, updated);
+  }
+}
+
 export function getSessionKeyByChatId(chatId: string): string | undefined {
   loadSessionsFromDb();
   return chatToSession.get(chatId);

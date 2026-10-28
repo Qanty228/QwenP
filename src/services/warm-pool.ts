@@ -9,6 +9,8 @@ import crypto from 'crypto';
 import { sleep } from '../utils/sleep.js';
 import { CACHED_TIMEZONE } from '../utils/qwen-constants.js';
 import { getQwenWebVersion } from './qwen-versions.js';
+import { hasExpiredBearerToken } from '../utils/access-token.js';
+import { keepTokenFresh, recoverHeadersFromUnauthorized } from './access-token-manager.js';
 
 function isTmdChallenge(text: string): boolean {
   return text.includes('FAIL_SYS_USER_VALIDATE') || text.includes('_____tmd_____') || text.includes('RGV587_ERROR');
@@ -51,6 +53,22 @@ function markWarmChatInFlight(accountId: string, chatId: string) {
 
 export function releaseWarmChat(accountId: string, chatId: string) {
   inFlightWarmChats.delete(warmChatKey(accountId, chatId));
+}
+
+/**
+ * Replaces the bearer token stored in every pooled warm-chat header set for an
+ * account. Warm entries are created ahead of time and can outlive the 15-minute
+ * access token they captured; without this upgrade they would keep replaying
+ * the dead token and upstream would answer "unauthorized: Token has expired".
+ */
+export function upgradeWarmPoolAuthorization(accountId: string, authorization: string) {
+  const pool = warmPool.get(accountId);
+  if (!pool) return;
+  for (const entry of pool) {
+    if (entry.headers['authorization'] !== authorization) {
+      entry.headers = { ...entry.headers, authorization };
+    }
+  }
 }
 
 /** Per-account ready warm chat counts (used by the admin dashboard). */
@@ -348,6 +366,9 @@ async function refillPoolForAccount(accountId: string) {
   let headers: Record<string, string>;
   try {
     const acctId = accountId === 'global' ? undefined : accountId;
+    // Keep the bearer token fresh before caching it in long-lived pool entries;
+    // stale copies are what makes "Token has expired" errors permanent.
+    await keepTokenFresh(acctId);
     headers = await getBasicQwenHeaders(acctId);
   } catch (err) {
     console.error(`[WarmPool] header fetch failed for ${accountId}:`, (err as Error).message);
@@ -442,6 +463,14 @@ export async function getWarmedChat(accountId?: string) {
   }
   if (pool.length === 0) throw new Error(`Warm pool empty after retry for ${key}`);
   const entry = pool.shift()!;
+  // Pooled entries can outlive the 15-minute access token they captured at
+  // refill time. Renew before handing one out, otherwise upstream rejects the
+  // request with "unauthorized: Token has expired" (surfaced as Error 502).
+  if (hasExpiredBearerToken(entry.headers)) {
+    console.log(`[WarmPool] Expired bearer token on pooled chat ${entry.chatId} for ${key}, renewing before use...`);
+    const recovered = await recoverHeadersFromUnauthorized(key === 'global' ? undefined : key, entry.headers);
+    if (recovered) entry.headers = recovered;
+  }
   markWarmChatInFlight(key, entry.chatId);
   return entry;
 }
