@@ -624,17 +624,45 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
   }
 
   if (!accessToken) {
-    const { refreshQwenAccessToken, renewAccessTokenViaPage } = await import('./browser-manager.js');
+    const { refreshQwenAccessToken, renewAccessTokenViaPage, hasRefreshTokenCookie } = await import('./browser-manager.js');
     accessToken = await refreshQwenAccessToken(page);
     if (!accessToken) {
       // The refresh endpoint only accepts requests issued by the real web
       // client, so let the frontend perform the refresh by reloading.
       accessToken = await renewAccessTokenViaPage(page);
     }
+    if (!accessToken && accountId) {
+      // Both silent minting paths failed. If the refresh_token cookie is gone
+      // the session is permanently dead and every upstream call will keep
+      // answering "unauthorized: Token has expired" until credentials are
+      // replayed. Try the automated UI login once before giving up.
+      const stillHasRefreshCookie = await hasRefreshTokenCookie(page).catch(() => false);
+      if (!stillHasRefreshCookie) {
+        const { getAccountCredentials } = await import('../core/accounts.js');
+        const creds = getAccountCredentials(getBaseAccountId(accountId));
+        if (creds && creds.email && creds.password) {
+          console.log(`[Playwright] Session fully expired for ${creds.email}, attempting automated re-login...`);
+          try {
+            const acctContext = accountContexts.get(accountId);
+            if (acctContext) {
+              const { loginToQwenWithContext, saveStorageState } = await import('./browser-manager.js');
+              const ok = await loginToQwenWithContext(acctContext, page, creds.email, creds.password);
+              if (ok) {
+                await saveStorageState(acctContext, getBaseAccountId(accountId)).catch(() => {});
+                accessToken = await refreshQwenAccessToken(page);
+                if (!accessToken) accessToken = await renewAccessTokenViaPage(page);
+              }
+            }
+          } catch (err: any) {
+            console.warn(`[Playwright] Automated re-login failed for ${cacheKey}: ${err.message}`);
+          }
+        }
+      }
+    }
     if (accessToken) {
       console.log(`[Playwright] Refreshed Qwen access token for ${cacheKey}.`);
     } else {
-      console.warn(`[Playwright] Could not refresh Qwen access token for ${cacheKey}.`);
+      console.warn(`[Playwright] Could not refresh Qwen access token for ${cacheKey}; a manual re-login (npm run login) is required.`);
     }
   }
 
