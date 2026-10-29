@@ -13,6 +13,14 @@ const streamCallbacks = new Map<string, {
 
 const abortControllers = new Map<string, () => void>();
 
+// Requests whose response headers ("meta") have already been relayed to Node.
+// The in-page fetch timeout must NOT abort these requests: once the headers are
+// out, the upstream may legitimately keep streaming SSE events for many minutes
+// and an AbortError at that point would surface as a spurious mid-stream error.
+// This set is keyed by reqId so a late timer inside the page can only cancel
+// its own request, never a newer one sharing the page.
+const metaDeliveredReqIds = new Set<string>();
+
 const pagesWithExposed = new WeakSet<Page>();
 
 async function ensureStreamBridge(page: Page): Promise<void> {
@@ -22,11 +30,11 @@ async function ensureStreamBridge(page: Page): Promise<void> {
     const cb = streamCallbacks.get(reqId);
     if (!cb) return;
     switch (type) {
-      case 'meta': cb.onMeta(data); break;
+      case 'meta': metaDeliveredReqIds.add(reqId); cb.onMeta(data); break;
       case 'chunk': cb.onChunk(data); break;
-      case 'end': cb.onEnd(); streamCallbacks.delete(reqId); abortControllers.delete(reqId); break;
-      case 'error': cb.onError(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); break;
-      case 'body': cb.onBody(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); break;
+      case 'end': cb.onEnd(); streamCallbacks.delete(reqId); abortControllers.delete(reqId); metaDeliveredReqIds.delete(reqId); break;
+      case 'error': cb.onError(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); metaDeliveredReqIds.delete(reqId); break;
+      case 'body': cb.onBody(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); metaDeliveredReqIds.delete(reqId); break;
     }
   });
 }
@@ -116,10 +124,21 @@ export async function browserStreamFetch(
   });
 
   const metaTimeoutMs = options.timeoutMs || config.timeouts.chat;
+  // The in-page fetch uses a longer overall timeout than the metadata wait:
+  // headers must arrive within metaTimeoutMs, but once they do, the SSE body
+  // may legitimately stream for far longer without being aborted.
+  const inPageTimeoutMs = Math.max(metaTimeoutMs * 2, metaTimeoutMs + 60000);
   const metaTimeout = setTimeout(() => {
     streamCallbacks.delete(reqId);
     abortControllers.delete(reqId);
-    metaReject(new Error(`Browser stream fetch timed out waiting for response metadata after ${metaTimeoutMs}ms`));
+    metaDeliveredReqIds.delete(reqId);
+    // Ask the page to cancel the still-pending fetch so the request does not
+    // linger on the browser lane after we gave up waiting for its headers.
+    page.evaluate((reqId: string) => {
+      const c = (window as any).__abortControllers?.[reqId];
+      if (c) { c.abort(); delete (window as any).__abortControllers[reqId]; }
+    }, reqId).catch(() => {});
+    metaReject(new Error(`Browser stream fetch timed out waiting for response headers after ${metaTimeoutMs}ms`));
   }, metaTimeoutMs);
 
   streamCallbacks.set(reqId, {
@@ -135,6 +154,14 @@ export async function browserStreamFetch(
     },
     onBody: () => {},
   });
+
+  // If the caller never consumes the result (e.g. an error path abandons it),
+  // clean up the reqId marker so it cannot leak into the global set.
+  const cleanupReqIdState = () => {
+    streamCallbacks.delete(reqId);
+    abortControllers.delete(reqId);
+    metaDeliveredReqIds.delete(reqId);
+  };
 
   let bodyResolve!: (value: string) => void;
   let bodyReject!: (reason: Error) => void;
@@ -157,26 +184,30 @@ export async function browserStreamFetch(
         cb.onEnd = () => {
           try { controller.close(); } catch { /* ignore */ }
           bodyResolve('');
-          streamCallbacks.delete(reqId);
-          abortControllers.delete(reqId);
+          cleanupReqIdState();
         };
         cb.onError = (msg: string) => {
           try { controller.error(new Error(msg)); } catch { /* ignore */ }
           bodyReject(new Error(msg));
-          streamCallbacks.delete(reqId);
-          abortControllers.delete(reqId);
+          cleanupReqIdState();
         };
         cb.onBody = (text: string) => {
           bodyResolve(text);
-          streamCallbacks.delete(reqId);
-          abortControllers.delete(reqId);
+          cleanupReqIdState();
         };
 
         page.evaluate(async ({ url, options, reqId, evalTimeoutMs }: any) => {
           const controller = new AbortController();
           (window as any).__abortControllers = (window as any).__abortControllers || {};
           (window as any).__abortControllers[reqId] = controller;
-          const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs || evalTimeoutMs);
+          // This timer only guards the wait for response HEADERS. Once the meta
+          // event has been relayed to Node, the request is considered "accepted"
+          // and must not be aborted mid-stream — long SSE generations are normal.
+          let headersArrived = false;
+          const timeoutId = setTimeout(() => {
+            if (headersArrived) return;
+            controller.abort();
+          }, evalTimeoutMs);
           try {
             const resp = await fetch(url, {
               method: options.method || 'POST',
@@ -184,6 +215,7 @@ export async function browserStreamFetch(
               body: options.body || undefined,
               signal: controller.signal,
             });
+            headersArrived = true;
             clearTimeout(timeoutId);
             const respHeaders: Record<string, string> = {};
             resp.headers.forEach((v: string, k: string) => { respHeaders[k] = v; });
@@ -249,14 +281,23 @@ export async function browserStreamFetch(
             delete (window as any).__abortControllers[reqId];
           } catch (e: any) {
             clearTimeout(timeoutId);
-            (window as any).__streamRelay(reqId, 'error', e.message);
+            // The in-page header-wait timer fired before response headers arrived.
+            // Node may have already surfaced its own "timed out waiting for response
+            // headers" error and torn down the callbacks; relay anyway so a still-
+            // listening consumer gets a clear message instead of hanging forever.
+            const abortedByHeaderTimeout = !headersArrived && e && (e.name === 'AbortError' || String(e.message || '').includes('abort'));
+            const msg = abortedByHeaderTimeout
+              ? `Browser stream fetch timed out waiting for response headers after ${evalTimeoutMs}ms`
+              : e.message;
+            (window as any).__streamRelay(reqId, 'error', msg);
             delete (window as any).__abortControllers[reqId];
           }
-        }, { url, options, reqId, evalTimeoutMs: metaTimeoutMs }).catch((e: any) => {
+        }, { url, options, reqId, evalTimeoutMs: inPageTimeoutMs }).catch((e: any) => {
           const cb = streamCallbacks.get(reqId);
           if (cb) {
             cb.onError(e.message);
           }
+          cleanupReqIdState();
         });
       },
       cancel() {
@@ -264,20 +305,26 @@ export async function browserStreamFetch(
           const c = (window as any).__abortControllers?.[reqId];
           if (c) { c.abort(); delete (window as any).__abortControllers[reqId]; }
         }, reqId).catch(() => {});
-        streamCallbacks.delete(reqId);
-        abortControllers.delete(reqId);
+        cleanupReqIdState();
       },
     });
 
     const meta = await metaPromise;
+
+    // Safety net: if the caller abandons this request without ever consuming or
+    // aborting the stream (e.g. an error thrown between meta and return), drop
+    // all reqId state after the overall in-page timeout would have elapsed.
+    // Legitimate consumers keep state alive via the relayed end/error/body events.
+    const leakTimer = setTimeout(cleanupReqIdState, inPageTimeoutMs);
+    leakTimer.unref?.();
 
     const abortFn = () => {
       page.evaluate((reqId: string) => {
         const c = (window as any).__abortControllers?.[reqId];
         if (c) { c.abort(); delete (window as any).__abortControllers[reqId]; }
       }, reqId).catch(() => {});
-      streamCallbacks.delete(reqId);
-      abortControllers.delete(reqId);
+      clearTimeout(leakTimer);
+      cleanupReqIdState();
     };
 
     abortControllers.set(reqId, abortFn);
