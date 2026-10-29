@@ -1,6 +1,6 @@
 import type { Context } from 'hono';
 import crypto from 'crypto';
-import { createQwenStream, RetryableQwenStreamError, QwenUpstreamError } from '../services/qwen.js';
+import { createQwenStream, RetryableQwenStreamError, QwenUpstreamError, isRetryableStreamFailure } from '../services/qwen.js';
 import { recordAccountBlock, requiresCrossAccountBootstrap, noteAccountRecovery } from '../core/account-isolation.js';
 import type { OpenAIRequest } from '../utils/types.js';
 import { getModelContextWindow } from '../core/model-registry.js'
@@ -621,8 +621,14 @@ export async function chatCompletions(c: Context) {
               let useDelay = retryDelay;
               if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
                 useDelay = err.retryAfterMs;
+              } else if (isRetryableStreamFailure(err)) {
+                // Transport-level failures (browser relay header timeouts,
+                // "fetch failed", socket hang ups) carry no upstream hint —
+                // back off exponentially instead of failing the request on
+                // the first attempt.
+                useDelay = retryDelay;
               }
-              const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
+              const isRetryable = err instanceof RetryableQwenStreamError || isRetryableStreamFailure(err) || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
               if (!isRetryable) {
                 lastError = err;
                 break;

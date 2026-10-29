@@ -1139,6 +1139,17 @@ export async function createQwenStream(
         throw new RetryableQwenStreamError(`Qwen browser stream returned empty non-stream ${browserResult.status} response for ${chatId}. The chat may still be processing the previous message.`, 2000 + Math.floor(Math.random() * 2000));
       } catch (browserErr: any) {
         if (browserErr instanceof QwenUpstreamError || browserErr instanceof RetryableQwenStreamError) throw browserErr;
+        // Transport-level failures of the browser relay (e.g. the in-page
+        // fetch never received response headers) are transient — surface them
+        // as retryable so the route's retry/failover loop keeps working
+        // instead of breaking out with a raw 502 on the first attempt.
+        if (/timed out waiting for response headers|browser stream fetch timed out/i.test(browserErr.message || '')) {
+          throw new RetryableQwenStreamError(
+            `Browser stream fetch failed with active Qwen page: ${browserErr.message}`,
+            2000 + Math.floor(Math.random() * 2000),
+            { cause: browserErr }
+          );
+        }
         throw new Error(`Browser stream fetch failed with active Qwen page: ${browserErr.message}`, { cause: browserErr });
       }
     }

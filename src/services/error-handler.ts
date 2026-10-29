@@ -1,7 +1,7 @@
 export class RetryableQwenStreamError extends Error {
   readonly retryAfterMs: number;
-  constructor(message: string, retryAfterMs: number) {
-    super(message);
+  constructor(message: string, retryAfterMs: number, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = 'RetryableQwenStreamError';
     this.retryAfterMs = retryAfterMs;
   }
@@ -93,10 +93,41 @@ export function bodyIndicatesExpiredToken(body: string | any): boolean {
 export function isExpiredTokenError(err: any): boolean {
   if (!err) return false;
   if (err instanceof QwenUpstreamError) return err.isUnauthorized;
+  // A transport-level failure (browser relay header timeout, socket hang up,
+  // DNS "fetch failed") can carry upstream text in its message but says
+  // nothing about the bearer token's validity. Never route those into the
+  // token-renewal replay path — they belong to the retry/failover path.
+  if (isRetryableStreamFailure(err)) return false;
   const msg = String(err?.message || '').toLowerCase();
   return msg.includes('token has expired')
     || msg.includes('please log in again')
     || msg.includes('unauthorized');
+}
+
+const RETRYABLE_STREAM_FAILURE_PATTERNS = [
+  'timed out waiting for response headers',
+  'browser stream fetch timed out',
+  'browser stream fetch failed',
+  'idle timeout',
+  'socket hang up',
+  'network error',
+  'failed to fetch',
+  'fetch failed',
+];
+
+/**
+ * True when an error signals a transient transport/stream failure rather than
+ * a permanent upstream rejection. These should be retried (with backoff and/or
+ * lane failover) instead of surfacing a raw 502 to the client.
+ */
+export function isRetryableStreamFailure(err: any): boolean {
+  if (!err) return false;
+  if (err instanceof RetryableQwenStreamError) return true;
+  // Explicit upstream rejections (rate limit, captcha, dead token) are not
+  // transport failures — the caller handles them via quarantine/rotation.
+  if (err instanceof QwenUpstreamError) return false;
+  const msg = String(err?.message || '').toLowerCase();
+  return RETRYABLE_STREAM_FAILURE_PATTERNS.some(p => msg.includes(p));
 }
 
 export function handleErrorBody(peekText: string, status: number): never {
